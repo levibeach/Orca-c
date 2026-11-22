@@ -238,9 +238,10 @@ The current multiplier is shown next to the BPM in the HUD, for example
 `120 2x`. Note durations scale with it, since they are derived from the frame
 length.
 
-Switching multipliers keeps the current beat phase: the fraction of the frame
-already elapsed is rescaled to the new frame length, so fast F-key changes stay
-on the grid instead of pushing the next beat out each time.
+Switching multipliers realigns the next frame to the underlying beat grid, so
+the new speed starts on a subdivision of the original beat instead of at an
+arbitrary offset. Fast F-key changes therefore stay on the grid instead of
+shifting the beat by a fraction of a frame.
 
 ## Extras
 

@@ -337,6 +337,8 @@ build_target() {
     orca|tui)
       add source_files osc_out.c sync.c term_util.c sysmisc.c thirdparty/oso.c tui_main.c
       add cc_flags -D_XOPEN_SOURCE_EXTENDED=1
+      # fmod() is used for beat-grid alignment in tui_main.c.
+      add libraries -lm
       # thirdparty headers (like sokol_time.h) should get -isystem for their
       # include dir so that any warnings they generate with our warning flags
       # are ignored. (sokol_time.h may generate sign conversion warning on

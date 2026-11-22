@@ -9,6 +9,8 @@
 #include "sync.h"
 #include "vmio.h"
 #include <getopt.h>
+#include <math.h>
+#include <time.h>
 #include <locale.h>
 
 #define SOKOL_IMPL
@@ -906,6 +908,7 @@ typedef struct {
   Ged_input_mode input_mode;
   Usz bpm;
   U64 clock;
+  U64 grid_wall_ms; // system-monotonic origin of the base (1x) beat grid
   double accum_secs;
   double time_to_next_note_off;
   // Per-instance tempo multiplier, expressed as a fraction so that 1/4, 1/2,
@@ -953,6 +956,7 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->rate_num = 1;
   a->rate_den = 1;
   a->clock = 0;
+  a->grid_wall_ms = 0;
   a->accum_secs = 0.0;
   a->time_to_next_note_off = 1.0;
   a->oosc_dev = NULL;
@@ -1277,6 +1281,15 @@ static bool ged_set_osc_udp(Ged *a, char const *dest_addr,
 
 static ORCA_FORCEINLINE double ms_to_sec(double ms) { return ms / 1000.0; }
 
+// System-wide monotonic time, shared across instances so beat grids can be
+// compared. stm_now() is per-process and is only used for local deadlines.
+static U64 wall_ms_now(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return 0;
+  return (U64)ts.tv_sec * 1000u + (U64)(ts.tv_nsec / 1000000);
+}
+
 // The local tempo multiplier as a double. Kept as a fraction in Ged so that
 // common ratios like 1/3 stay exact; the frame math needs a double.
 static ORCA_FORCEINLINE double ged_rate(Ged const *a) {
@@ -1307,6 +1320,29 @@ staticni void ged_rescale_phase(Ged *a, double old_span, double new_span) {
     fraction = 0.0;
   a->clock = now;
   a->accum_secs = fraction * new_span;
+}
+
+// Align the next frame to the base (1x) beat grid when the local multiplier
+// changes. Keeping the fraction of the current rate-scaled frame is not
+// enough: at 2x the grid has to land on subdivisions of the original beat,
+// otherwise switching rates mid-frame shifts the beat by a fraction of a
+// frame. The deadline engine fires when elapsed + accum >= span, so a
+// negative accum just means waiting longer than one new frame.
+staticni void ged_align_rate_to_grid(Ged *a) {
+  double base_span = 60.0 / (double)a->bpm / 4.0;
+  double new_span = ged_frame_secs(a);
+  U64 now = stm_now();
+  double since_grid = (double)(wall_ms_now() - a->grid_wall_ms) / 1000.0;
+  double phase = fmod(since_grid, base_span);
+  if (phase < 0.0)
+    phase += base_span;
+  double to_next = base_span - phase;
+  // Already on the grid: fire immediately rather than waiting a full base
+  // frame, so a switch made right on the beat does not stall.
+  if (phase < 1e-6 || to_next > base_span - 1e-6)
+    to_next = 0.0;
+  a->clock = now;
+  a->accum_secs = new_span - to_next;
 }
 
 static double ged_secs_to_deadline(Ged const *a) {
@@ -1554,7 +1590,7 @@ staticni void ged_adjust_bpm(Ged *a, Isz delta_bpm) {
     // it, and the master will override us on its next state packet.
     osync_announce(&a->sync, a->sync.role == Osync_role_master,
                    a->is_playing, (I32)new_bpm, (U32)a->tick_num,
-                   a->rate_num, a->rate_den, false);
+                   a->rate_num, a->rate_den, (U32)a->grid_wall_ms, false);
   }
   a->is_draw_dirty = true;
 }
@@ -1570,16 +1606,15 @@ staticni void ged_set_rate(Ged *a, I32 num, I32 den) {
     den = 1;
   if (num == a->rate_num && den == a->rate_den)
     return;
-  double old_span = ged_frame_secs(a);
   a->rate_num = num;
   a->rate_den = den;
-  // Keep the current phase: only the frame length changed, not the downbeat.
-  ged_rescale_phase(a, old_span, ged_frame_secs(a));
+  // Keep the base beat grid, not the fraction of the old rate-scaled frame.
+  ged_align_rate_to_grid(a);
   a->is_draw_dirty = true;
   if (a->sync_enabled)
     osync_announce(&a->sync, a->sync.role == Osync_role_master, a->is_playing,
                    (I32)a->bpm, (U32)a->tick_num, a->rate_num, a->rate_den,
-                   false);
+                   (U32)a->grid_wall_ms, false);
 }
 
 // Apply the master's tempo and transport to a follower. The local tick
@@ -1642,8 +1677,12 @@ staticni void ged_sync_poll(Ged *a) {
       // faster tempos, so accept the first few frames of a bar.
       if (phase <= 2) {
         a->tick_num = (Usz)master_tick;
-        a->clock = stm_now();
-        a->accum_secs = 0.0;
+        a->bpm = (Usz)master_bpm;
+        ged_send_osc_bpm(a, master_bpm);
+        a->grid_wall_ms = osync_master_grid_ms(&a->sync);
+        osync_set_grid_ms(&a->sync, (U32)a->grid_wall_ms);
+        // Start the first frame on the master's grid, not on packet arrival.
+        ged_align_rate_to_grid(a);
         a->sync_aligned = true;
         a->sync_waiting_bar = false;
         a->is_draw_dirty = true;
@@ -1678,7 +1717,7 @@ staticni void ged_sync_poll(Ged *a) {
   if (now - a->sync.last_announce_ms >= 250) {
     osync_announce(&a->sync, a->sync.role == Osync_role_master,
                    a->is_playing, (I32)a->bpm, (U32)a->tick_num,
-                   a->rate_num, a->rate_den, false);
+                   a->rate_num, a->rate_den, (U32)a->grid_wall_ms, false);
   }
 }
 
@@ -2037,6 +2076,14 @@ staticni void ged_set_playing(Ged *a, bool playing) {
     undo_history_push(&a->undo_hist, &a->field, a->tick_num);
     a->is_playing = true;
     a->clock = stm_now();
+    // A follower that has aligned to a master must keep that grid origin;
+    // starting playback here happens after the alignment and would otherwise
+    // overwrite it with the local boot time.
+    if (!(a->sync_enabled && a->sync_aligned &&
+          a->sync.role == Osync_role_follower)) {
+      a->grid_wall_ms = wall_ms_now();
+    }
+    osync_set_grid_ms(&a->sync, (U32)a->grid_wall_ms);
     a->midi_bclock_sixths = 0;
     // dumb'n'dirty, get us close to the next step time, but not quite
     a->accum_secs = ged_frame_secs(a);
@@ -2049,7 +2096,7 @@ staticni void ged_set_playing(Ged *a, bool playing) {
     if (a->sync_enabled)
       osync_announce(&a->sync, a->sync.role == Osync_role_master, playing,
                      (I32)a->bpm, (U32)a->tick_num, a->rate_num, a->rate_den,
-                     false);
+                     (U32)a->grid_wall_ms, false);
   } else {
     ged_stop_all_sustained_notes(a);
     a->is_playing = false;
@@ -2057,7 +2104,7 @@ staticni void ged_set_playing(Ged *a, bool playing) {
     if (a->sync_enabled)
       osync_announce(&a->sync, a->sync.role == Osync_role_master, playing,
                      (I32)a->bpm, (U32)a->tick_num, a->rate_num, a->rate_den,
-                     false);
+                     (U32)a->grid_wall_ms, false);
     if (a->midi_bclock)
       send_midi_byte(a->oosc_dev, &a->midi_mode, 0xFC); // "stop"
   }
@@ -3707,7 +3754,7 @@ int main(int argc, char **argv) {
       // hear its reply.
       osync_announce(&t.ged.sync, t.ged.sync.role == Osync_role_master,
                      t.ged.is_playing, (I32)t.ged.bpm, 0, t.ged.rate_num,
-                     t.ged.rate_den, true);
+                     t.ged.rate_den, (U32)t.ged.grid_wall_ms, true);
     } else {
       t.sync_error = true;
     }

@@ -230,10 +230,11 @@ static Usz build_packet(char *buf, Usz buf_size, char const *path,
 // packet arrival.
 static void send_state(Osync *s, char const *path, bool is_master, bool playing,
                        I32 bpm, U32 tick_low, I32 rate_num, I32 rate_den,
-                       struct sockaddr const *dest, socklen_t dest_len) {
+                       U32 grid_ms_low, struct sockaddr const *dest,
+                       socklen_t dest_len) {
   if (!s->dev)
     return;
-  I32 vals[8];
+  I32 vals[9];
   vals[0] = (I32)s->self_id;
   vals[1] = is_master ? 1 : 0;
   vals[2] = bpm;
@@ -245,6 +246,9 @@ static void send_state(Osync *s, char const *path, bool is_master, bool playing,
   // wrong: a newcomer with a lower pid would steal the role from the
   // instance that has already been running.
   vals[7] = (I32)s->started_ms;
+  // Origin of the master's base beat grid, so followers lock to its exact
+  // beat rather than to whenever the packet happened to arrive.
+  vals[8] = (I32)grid_ms_low;
   char buf[256];
   Usz n = build_packet(buf, sizeof buf, path, vals, ORCA_ARRAY_COUNTOF(vals));
   if (!n)
@@ -256,7 +260,8 @@ static void send_state(Osync *s, char const *path, bool is_master, bool playing,
 }
 
 void osync_announce(Osync *s, bool is_master, bool playing, I32 bpm,
-                    U32 tick_low, I32 rate_num, I32 rate_den, bool hello) {
+                    U32 tick_low, I32 rate_num, I32 rate_den,
+                    U32 grid_ms_low, bool hello) {
   if (!s->enabled || !s->dev)
     return;
   char const *path = hello ? path_hello : path_state;
@@ -264,7 +269,7 @@ void osync_announce(Osync *s, bool is_master, bool playing, I32 bpm,
   if (s->multicast) {
     // One send reaches every instance in the group.
     send_state(s, path, is_master, playing, bpm, tick_low, rate_num, rate_den,
-               NULL, 0);
+               grid_ms_low, NULL, 0);
   } else {
     // Unicast: sweep the port range so instances that started before us are
     // discovered, and let each one learn our address from the reply.
@@ -281,7 +286,7 @@ void osync_announce(Osync *s, bool is_master, bool playing, I32 bpm,
       if (to.sin_addr.s_addr == INADDR_NONE)
         continue;
       send_state(s, path, is_master, playing, bpm, tick_low, rate_num, rate_den,
-                 (struct sockaddr const *)&to, sizeof to);
+                 grid_ms_low, (struct sockaddr const *)&to, sizeof to);
     }
   }
 
@@ -291,7 +296,7 @@ void osync_announce(Osync *s, bool is_master, bool playing, I32 bpm,
     if (!p->addr_len)
       continue;
     send_state(s, path, is_master, playing, bpm, tick_low, rate_num, rate_den,
-               (struct sockaddr const *)&p->addr, p->addr_len);
+               grid_ms_low, (struct sockaddr const *)&p->addr, p->addr_len);
   }
   s->last_announce_ms = now_ms();
 }
@@ -333,6 +338,15 @@ bool osync_master_playing(Osync const *s) {
   return m ? m->playing : false;
 }
 
+U32 osync_master_grid_ms(Osync const *s) {
+  Osync_peer const *m = find_master(s);
+  return m ? m->grid_ms_low : 0;
+}
+
+void osync_set_grid_ms(Osync *s, U32 grid_ms_low) {
+  s->self_grid_ms = grid_ms_low;
+}
+
 Usz osync_peer_count(Osync const *s) {
   Usz n = 0;
   for (Osync_peer const *p = s->peers; p; p = p->next)
@@ -348,15 +362,16 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
                           struct sockaddr const *src, socklen_t src_len) {
   char const *path = NULL;
   Usz path_len = 0;
-  I32 vals[8];
+  I32 vals[9];
   Isz n = oosc_parse_int32s(data, size, &path, &path_len, vals,
                             ORCA_ARRAY_COUNTOF(vals));
   if (n < 6)
     return false;
-  // Older senders omit the transport flag and start time. Assume they are
-  // playing and tie on start time so the id tiebreak still applies.
+  // Older senders omit later fields. Assume they are playing and tie on
+  // start time so the id tiebreak still applies.
   bool peer_playing = n >= 7 ? vals[6] != 0 : true;
   U32 peer_started = n >= 8 ? (U32)vals[7] : (U32)s->started_ms;
+  U32 peer_grid_ms = n >= 9 ? (U32)vals[8] : 0;
   bool is_hello = path_is(path, path_len, "orca/sync/hello");
   bool is_state = path_is(path, path_len, "orca/sync/state");
   if (!is_hello && !is_state)
@@ -385,6 +400,7 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
   p->tick_low = (U32)vals[3];
   p->rate_num = vals[4];
   p->rate_den = vals[5] == 0 ? 1 : vals[5];
+  p->grid_ms_low = peer_grid_ms;
   if (src_len > 0 && (Usz)src_len <= sizeof p->addr) {
     memcpy(&p->addr, src, (size_t)src_len);
     p->addr_len = src_len;
@@ -424,7 +440,7 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
     bool we_master = s->role == Osync_role_master;
     osync_announce(s, we_master, we_master ? peer_playing : false,
                    we_master ? bpm : 0, we_master ? (U32)vals[3] : 0, 1, 1,
-                   false);
+                   we_master ? s->self_grid_ms : 0, false);
   }
 
   return changed;
