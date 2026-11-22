@@ -65,6 +65,7 @@ fprintf(stderr,
 "                           theme colors otherwise. Collisions are reassigned.\n"
 "    --edit-mode <mode>     master (default): only the master can edit cells.\n"
 "                           open: everyone applies and broadcasts edits.\n"
+"                           The master changes the mode for the whole group.\n"
 "    -h or --help           Print this message and exit.\n"
 "\n"
 "OSC/MIDI options:\n"
@@ -3672,14 +3673,19 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         break;
       }
       case Edit_mode_menu_id:
-        osync_set_edit_mode(
-            &t->ged.sync,
-            act.picked.id == Edit_mode_open_id ? Osync_edit_mode_open
-                                               : Osync_edit_mode_master);
-        osync_announce(&t->ged.sync, t->ged.sync.role == Osync_role_master,
-                       t->ged.is_playing, (I32)t->ged.bpm, 0, t->ged.rate_num,
-                       t->ged.rate_den, (U32)t->ged.grid_wall_ms, false);
-        t->ged.is_draw_dirty = true;
+        if (t->ged.sync_enabled && t->ged.sync.role != Osync_role_master) {
+          qmsg_printf_push("Shared Editing",
+                           "Only the master can change this setting.");
+        } else {
+          osync_set_edit_mode(
+              &t->ged.sync,
+              act.picked.id == Edit_mode_open_id ? Osync_edit_mode_open
+                                                 : Osync_edit_mode_master);
+          osync_announce(&t->ged.sync, t->ged.sync.role == Osync_role_master,
+                         t->ged.is_playing, (I32)t->ged.bpm, 0, t->ged.rate_num,
+                         t->ged.rate_den, (U32)t->ged.grid_wall_ms, false);
+          t->ged.is_draw_dirty = true;
+        }
         qnav_stack_pop();
         pop_qnav_if_main_menu();
         break;

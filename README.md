@@ -245,11 +245,11 @@ cannot make every user look the same; peers with the same `--color` get
 different slots. The second HUD line lists connected peers by name in their
 chosen colors.
 
-By default only the master can edit cells; followers are view-only. Use
-`--edit-mode open`, or the main menu's `Shared Editing` item and choose
+By default only the master can edit cells; followers are view-only. The master
+uses `--edit-mode open`, or the main menu's `Shared Editing` item and chooses
 `Everyone edits`, to let every participant apply and broadcast edits directly.
 The mode is announced to peers and carried on every edit; mixed-mode edits are
-rejected. Use the same mode on every instance.
+rejected, and only the master can change the mode.
 
 The master snapshots the full grid every two seconds, so an instance that joins
 late or loses packets converges to the current grid. Run all instances with

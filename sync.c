@@ -705,6 +705,10 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
         s->have_master = true;
         s->last_master_seen_ms = now_ms();
         changed = true;
+      if (n >= 15 && s->edit_mode != p->edit_mode) {
+        s->edit_mode = p->edit_mode;
+        changed = true;
+      }
       } else {
         // We are the older master. Keep the peer for direct addressing but
         // do not treat it as authoritative.
@@ -714,6 +718,10 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
     } else {
       s->have_master = true;
       s->last_master_seen_ms = now_ms();
+      if (n >= 15 && s->edit_mode != p->edit_mode) {
+        s->edit_mode = p->edit_mode;
+        changed = true;
+      }
     }
   }
 
