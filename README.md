@@ -111,6 +111,17 @@ General options:
                            Default: 120
     --seed <number>        Set the seed for the random function.
                            Default: 1
+    --rate <ratio>         Set the local tempo multiplier, as a fraction
+                           or a whole number. Examples: 2, 3, 1/2, 1/4,
+                           3/2. Default: 1
+    --sync <addr:port>     Join an instance sync group at this address and
+                           port, e.g. 127.0.0.1:9999. The first instance
+                           to start is the master; later ones follow its
+                           tempo and start/stop.
+    --sync-multicast <group:port>
+                           Like --sync, but join a multicast group so
+                           instances on the same machine or LAN find each
+                           other automatically. Example: 239.255.0.1:9999
     -h or --help           Print this message and exit.
 
 OSC/MIDI options:
@@ -156,6 +167,7 @@ $ build/orca                             # run orca
 │           Escape  Return to Normal Mode or Deselect │
 │  ( ) _ + [ ] { }  Adjust Grid Size and Rulers       │
 │          < and >  Adjust BPM                        │
+│          F2..F7  Tempo Multiplier (1/4..4x)         │
 │                ?  Controls (this message)           │
 └─────────────────────────────────────────────────────┘
 ```
@@ -172,6 +184,63 @@ You can also make `cli` read from stdin:
 ```sh
 echo -e "...\na34\n..." | cli /dev/stdin
 ```
+
+## Running several instances together
+
+Two or more `orca` instances can share one tempo and transport, so starting
+and stopping happens everywhere at once while each grid runs at its own
+multiple of the beat.
+
+```sh
+build/orca --sync 127.0.0.1:9999 --bpm 120     # master
+build/orca --sync 127.0.0.1:9999 --rate 2      # follower, double speed
+build/orca --sync 127.0.0.1:9999 --rate 1/2    # follower, half speed
+```
+
+The first instance to start becomes the master and the rest follow it. A new
+follower holds its first frames until the master reaches a bar boundary, then
+adopts the master's frame counter, so it comes in on the downbeat instead of
+whenever its boot happened to finish. After that it adopts the master's BPM
+and play/pause state. The frame counter then runs locally, because a 2x
+follower necessarily advances through frames twice as fast. If the master
+exits, a follower takes over.
+
+For instances on different machines, or to avoid coordinating ports, use a
+multicast group instead; every instance then finds the others automatically:
+
+```sh
+build/orca --sync-multicast 239.255.0.1:9999
+```
+
+`--sync` binds the given port for the first instance and walks upward
+(`9999`, `10000`, ...) for each additional one, since two sockets sharing one
+port would have their incoming traffic divided between them.
+
+## Tempo multipliers
+
+Each instance has a local tempo multiplier applied on top of the shared BPM.
+The master's BPM is unaffected, so instances can run at different speeds
+against the same beat without fighting over the clock.
+
+Set it at startup with `--rate` (a whole number or a fraction), change it while
+playing with `F2`–`F7`, or pick from `Clock & Timing -> Tempo Multiplier`:
+
+| Key | Menu | Multiplier |
+|---|---|---|
+| `F2` | 1/4 speed (quarter time) | 1/4 |
+| `F3` | 1/2 speed | 1/2 |
+| `F4` | Normal speed (1x) | 1 |
+| `F5` | Double speed (2x) | 2 |
+| `F6` | Triple speed (3x) | 3 |
+| `F7` | Quadruple speed (4x) | 4 |
+
+The current multiplier is shown next to the BPM in the HUD, for example
+`120 2x`. Note durations scale with it, since they are derived from the frame
+length.
+
+Switching multipliers keeps the current beat phase: the fraction of the frame
+already elapsed is rescaled to the new frame length, so fast F-key changes stay
+on the grid instead of pushing the next beat out each time.
 
 ## Extras
 

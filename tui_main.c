@@ -6,6 +6,7 @@
 #include "sim.h"
 #include "sysmisc.h"
 #include "term_util.h"
+#include "sync.h"
 #include "vmio.h"
 #include <getopt.h>
 #include <locale.h>
@@ -44,6 +45,17 @@ fprintf(stderr,
 "                           Default: 120\n"
 "    --seed <number>        Set the seed for the random function.\n"
 "                           Default: 1\n"
+"    --rate <ratio>         Set the local tempo multiplier, as a fraction\n"
+"                           or a whole number. Examples: 2, 3, 1/2, 1/4,\n"
+"                           3/2. Default: 1\n"
+"    --sync <addr:port>     Join an instance sync group at this address and\n"
+"                           port, e.g. 127.0.0.1:9999. The first instance\n"
+"                           to start is the master; later ones follow its\n"
+"                           tempo and start/stop.\n"
+"    --sync-multicast <group:port>\n"
+"                           Like --sync, but join a multicast group so\n"
+"                           instances on the same machine or LAN find each\n"
+"                           other automatically. Example: 239.255.0.1:9999\n"
 "    -h or --help           Print this message and exit.\n"
 "\n"
 "OSC/MIDI options:\n"
@@ -458,7 +470,8 @@ staticni void advance_faketab(WINDOW *win, int offset_x, int tabstop) {
 staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
                        char const *filename, Usz field_h, Usz field_w,
                        Usz ruler_spacing_y, Usz ruler_spacing_x, Usz tick_num,
-                       Usz bpm, Ged_cursor const *ged_cursor,
+                       Usz bpm, I32 rate_num, I32 rate_den,
+                       Ged_cursor const *ged_cursor,
                        Ged_input_mode input_mode, Usz activity_counter) {
   (void)height;
   (void)width;
@@ -471,6 +484,14 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
   wprintw(win, "%zuf", tick_num);
   advance_faketab(win, win_x, Tabstop);
   wprintw(win, "%zu", bpm);
+  if (rate_num != rate_den) {
+    if (rate_den == 1)
+      wprintw(win, " %dx", (int)rate_num);
+    else if (rate_num == 1)
+      wprintw(win, " 1/%dx", (int)rate_den);
+    else
+      wprintw(win, " %d/%dx", (int)rate_num, (int)rate_den);
+  }
   advance_faketab(win, win_x, Tabstop);
   print_activity_indicator(win, activity_counter);
   wmove(win, win_y + 1, win_x);
@@ -887,6 +908,10 @@ typedef struct {
   U64 clock;
   double accum_secs;
   double time_to_next_note_off;
+  // Per-instance tempo multiplier, expressed as a fraction so that 1/4, 1/2,
+  // 3/2 etc. are exact. frame_secs = 60 / bpm / 4 / (rate_num / rate_den).
+  I32 rate_num, rate_den;
+  Osync sync;
   Oosc_dev *oosc_dev;
   Midi_mode midi_mode;
   Usz activity_counter;
@@ -905,6 +930,10 @@ typedef struct {
   bool is_mouse_down : 1;
   bool is_mouse_dragging : 1;
   bool is_hud_visible : 1;
+  bool sync_enabled : 1;
+  bool sync_changed : 1; // set when a sync packet moved us; read by the loop
+  bool sync_aligned : 1; // adopted the master's frame phase once this session
+  bool sync_waiting_bar : 1; // holding playback until the master's next downbeat
 } Ged;
 
 static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
@@ -921,6 +950,8 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->ruler_spacing_y = a->ruler_spacing_x = 8;
   a->input_mode = Ged_input_mode_normal;
   a->bpm = init_bpm;
+  a->rate_num = 1;
+  a->rate_den = 1;
   a->clock = 0;
   a->accum_secs = 0.0;
   a->time_to_next_note_off = 1.0;
@@ -942,6 +973,11 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->is_mouse_down = false;
   a->is_mouse_dragging = false;
   a->is_hud_visible = false;
+  a->sync_enabled = false;
+  a->sync_changed = false;
+  memset(&a->sync, 0, sizeof a->sync);
+  a->sync_aligned = false;
+  a->sync_waiting_bar = false;
 }
 
 static void ged_deinit(Ged *a) {
@@ -956,6 +992,7 @@ static void ged_deinit(Ged *a) {
   if (a->oosc_dev)
     oosc_dev_destroy(a->oosc_dev);
   midi_mode_deinit(&a->midi_mode);
+  osync_deinit(&a->sync);
 }
 
 static bool ged_is_draw_dirty(Ged *a) {
@@ -1072,7 +1109,8 @@ staticni void ged_stop_all_sustained_notes(Ged *a) {
 // reason.
 
 staticni void send_output_events(Oosc_dev *oosc_dev, Midi_mode *midi_mode,
-                                 Usz bpm, Susnote_list *susnote_list,
+                                 Usz bpm, double rate,
+                                 Susnote_list *susnote_list,
                                  Oevent const *events, Usz count) {
   enum { Midi_on_capacity = 512 };
   typedef struct {
@@ -1090,7 +1128,7 @@ staticni void send_output_events(Oosc_dev *oosc_dev, Midi_mode *midi_mode,
   Susnote new_susnotes[Midi_on_capacity];
   Usz midi_note_count = 0;
   Usz monofied_chans = 0; // bitset of channels with new mono notes
-  double frame_secs = 60.0 / (double)bpm / 4.0;
+  double frame_secs = 60.0 / (double)bpm / 4.0 / rate;
 
   for (Usz i = 0; i < count; ++i) {
     Oevent const *e = events + i;
@@ -1239,10 +1277,42 @@ static bool ged_set_osc_udp(Ged *a, char const *dest_addr,
 
 static ORCA_FORCEINLINE double ms_to_sec(double ms) { return ms / 1000.0; }
 
-static double ged_secs_to_deadline(Ged const *a) {
-  if (!a->is_playing)
+// The local tempo multiplier as a double. Kept as a fraction in Ged so that
+// common ratios like 1/3 stay exact; the frame math needs a double.
+static ORCA_FORCEINLINE double ged_rate(Ged const *a) {
+  if (a->rate_num == a->rate_den)
     return 1.0;
-  double secs_span = 60.0 / (double)a->bpm / 4.0;
+  if (a->rate_den == 0)
+    return 1.0;
+  return (double)a->rate_num / (double)a->rate_den;
+}
+
+// Seconds between ORCA frames at the current tempo and multiplier.
+static ORCA_FORCEINLINE double ged_frame_secs(Ged const *a) {
+  return 60.0 / (double)a->bpm / 4.0 / ged_rate(a);
+}
+
+// Switch to a new frame length without moving the beat. The fraction of the
+// current frame already elapsed is kept, so the next frame arrives at the
+// same point in the bar under the new tempo. Zeroing accum_secs here instead
+// would restart the frame on every rate change, and fast switching would
+// starve the transport entirely.
+staticni void ged_rescale_phase(Ged *a, double old_span, double new_span) {
+  U64 now = stm_now();
+  double progress = stm_sec(stm_diff(now, a->clock)) + a->accum_secs;
+  double fraction = progress / old_span;
+  // A negative or already-overdue fraction means we cannot preserve a
+  // meaningful phase; start the new frame from now.
+  if (!(fraction > 0.0) || fraction >= 1.0)
+    fraction = 0.0;
+  a->clock = now;
+  a->accum_secs = fraction * new_span;
+}
+
+static double ged_secs_to_deadline(Ged const *a) {
+  if (!a->is_playing || a->sync_waiting_bar)
+    return 1.0;
+  double secs_span = ged_frame_secs(a);
   // If MIDI beat clock output is enabled, we need to send an event every 24
   // parts per quarter note. Since we've already divided quarter notes into 4
   // for ORCA's timing semantics, divide it by a further 6. This same logic is
@@ -1267,9 +1337,11 @@ staticni void clear_and_run_vm(Glyph *restrict gbuf, Mark *restrict mbuf,
 }
 
 staticni void ged_do_stuff(Ged *a) {
-  if (!a->is_playing)
+  // A fresh follower holds its first frames until the master reaches a bar
+  // boundary, so it comes in on the downbeat rather than at boot time.
+  if (!a->is_playing || a->sync_waiting_bar)
     return;
-  double secs_span = 60.0 / (double)a->bpm / 4.0;
+  double secs_span = ged_frame_secs(a);
   if (a->midi_bclock) // see also ged_secs_to_deadline()
     secs_span /= 6.0;
   Oosc_dev *oosc_dev = a->oosc_dev;
@@ -1321,6 +1393,8 @@ staticni void ged_do_stuff(Ged *a) {
   }
   apply_time_to_sustained_notes(oosc_dev, midi_mode, secs_span,
                                 &a->susnote_list, &a->time_to_next_note_off);
+  // The sustained-note duration is derived from frame_secs, so a rate change
+  // automatically re-scales notes already sounding. See send_output_events.
   clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
                    a->field.width, a->tick_num, &a->oevent_list,
                    a->random_seed);
@@ -1330,8 +1404,8 @@ staticni void ged_do_stuff(Ged *a) {
 
   Usz count = a->oevent_list.count;
   if (count > 0) {
-    send_output_events(oosc_dev, midi_mode, a->bpm, &a->susnote_list,
-                       a->oevent_list.buffer, count);
+    send_output_events(oosc_dev, midi_mode, a->bpm, ged_rate(a),
+                       &a->susnote_list, a->oevent_list.buffer, count);
     a->activity_counter += count;
   }
 }
@@ -1446,13 +1520,16 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
     int hud_x = win_w > 50 + a->softmargin_x * 2 ? a->softmargin_x : 0;
     draw_hud(win, a->grid_h, hud_x, Hud_height, win_w, filename,
              a->field.height, a->field.width, a->ruler_spacing_y,
-             a->ruler_spacing_x, a->tick_num, a->bpm, &a->ged_cursor,
-             a->input_mode, a->activity_counter);
+             a->ruler_spacing_x, a->tick_num, a->bpm, a->rate_num,
+             a->rate_den, &a->ged_cursor, a->input_mode,
+             a->activity_counter);
   }
   if (a->draw_event_list)
     draw_oevent_list(win, &a->oevent_list);
   a->is_draw_dirty = false;
 }
+
+staticni void ged_set_playing(Ged *a, bool playing);
 
 staticni void ged_send_osc_bpm(Ged *a, I32 bpm) {
   send_num_message(a->oosc_dev, "/orca/bpm", bpm);
@@ -1470,6 +1547,138 @@ staticni void ged_adjust_bpm(Ged *a, Isz delta_bpm) {
     a->bpm = (Usz)new_bpm;
     a->is_draw_dirty = true;
     ged_send_osc_bpm(a, (I32)new_bpm);
+  }
+  if (a->sync_enabled) {
+    // Followers adopt the master's tempo, so a local tempo edit is only
+    // authoritative when we are the master. As a follower we still announce
+    // it, and the master will override us on its next state packet.
+    osync_announce(&a->sync, a->sync.role == Osync_role_master,
+                   a->is_playing, (I32)new_bpm, (U32)a->tick_num,
+                   a->rate_num, a->rate_den, false);
+  }
+  a->is_draw_dirty = true;
+}
+
+// Set the local tempo multiplier. `num`/`den` is a fraction so that ratios
+// such as 1/3 are exact. Only the local frame rate changes; the master tempo
+// reported to peers is unaffected, which is what lets two instances run at
+// different multiples of the same beat.
+staticni void ged_set_rate(Ged *a, I32 num, I32 den) {
+  if (num < 1)
+    num = 1;
+  if (den < 1)
+    den = 1;
+  if (num == a->rate_num && den == a->rate_den)
+    return;
+  double old_span = ged_frame_secs(a);
+  a->rate_num = num;
+  a->rate_den = den;
+  // Keep the current phase: only the frame length changed, not the downbeat.
+  ged_rescale_phase(a, old_span, ged_frame_secs(a));
+  a->is_draw_dirty = true;
+  if (a->sync_enabled)
+    osync_announce(&a->sync, a->sync.role == Osync_role_master, a->is_playing,
+                   (I32)a->bpm, (U32)a->tick_num, a->rate_num, a->rate_den,
+                   false);
+}
+
+// Apply the master's tempo and transport to a follower. The local tick
+// counter is deliberately left alone: each instance has its own tempo
+// multiplier, so its frames advance at a different rate and forcing the
+// counters together would both fight the multiplier and make the displayed
+// number jump around.
+staticni void ged_sync_apply(Ged *a) {
+  Osync *s = &a->sync;
+  I32 bpm = osync_master_bpm(s);
+
+  if (bpm < 1)
+    return;
+
+  if (bpm != (I32)a->bpm) {
+    double old_span = ged_frame_secs(a);
+    a->bpm = (Usz)bpm;
+    ged_send_osc_bpm(a, bpm);
+    ged_rescale_phase(a, old_span, ged_frame_secs(a));
+    a->is_draw_dirty = true;
+  }
+
+  // Transport follows the master's explicit play/pause flag. Inferring it
+  // from packet arrival was wrong: a paused master keeps announcing, so the
+  // follower would have kept playing while the master was stopped.
+  bool playing = osync_master_playing(s);
+  if (a->is_playing != playing)
+    ged_set_playing(a, playing);
+}
+
+// Called once per main-loop iteration. Polls the sync socket and, if anything
+// changed locally, re-aligns the clock and marks the display dirty.
+staticni void ged_sync_poll(Ged *a) {
+  if (!a->sync_enabled)
+    return;
+  bool changed = osync_poll(&a->sync);
+
+  // A newly started follower holds its frames until the master is at the
+  // start of a bar, then adopts the master's frame counter once. That makes
+  // the follower come in on the downbeat instead of whenever its boot
+  // happened to finish. This is a single alignment, not a continuous
+  // correction -- continuous snapping would fight the local rate multiplier.
+  enum { Bar_frames = 16 }; // Orca has four frames per beat
+  if (a->sync.role == Osync_role_master) {
+    // If we take over, align again the next time we follow someone.
+    a->sync_aligned = false;
+    a->sync_waiting_bar = false;
+  } else if (!a->sync_aligned && osync_have_master(&a->sync)) {
+    I32 master_bpm = osync_master_bpm(&a->sync);
+    I64 master_tick = osync_master_tick(&a->sync);
+    if (master_bpm >= 1 && master_tick >= 0) {
+      if (!a->sync_waiting_bar) {
+        a->sync_waiting_bar = true;
+        if (a->is_playing)
+          ged_set_playing(a, false);
+        a->is_draw_dirty = true;
+      }
+      Usz phase = (Usz)master_tick % Bar_frames;
+      // State packets go out every 250ms, which can be a couple of frames at
+      // faster tempos, so accept the first few frames of a bar.
+      if (phase <= 2) {
+        a->tick_num = (Usz)master_tick;
+        a->clock = stm_now();
+        a->accum_secs = 0.0;
+        a->sync_aligned = true;
+        a->sync_waiting_bar = false;
+        a->is_draw_dirty = true;
+        changed = true; // let ged_sync_apply restore the master's transport
+      }
+    }
+  }
+
+  // osync_poll() reports only role changes. The master's tempo and transport
+  // also need applying, and those change without the role changing. The local
+  // tick is intentionally not compared: different rates mean the counters are
+  // supposed to diverge.
+  bool master_state_changed = false;
+  if (a->sync.role == Osync_role_follower) {
+    I32 master_bpm = osync_master_bpm(&a->sync);
+    master_state_changed =
+        (master_bpm >= 1 && master_bpm != (I32)a->bpm) ||
+        osync_master_playing(&a->sync) != a->is_playing;
+  }
+  if (changed) {
+    a->sync_changed = true;
+    a->is_draw_dirty = true;
+    ged_sync_apply(a);
+  } else if (master_state_changed) {
+    // Keep the follower aligned with the master's tempo and transport.
+    ged_sync_apply(a);
+  }
+  // Periodic announcement, whether or not anything changed. Followers keep
+  // telling the master they are here; the master keeps broadcasting so late
+  // joiners can lock on.
+  U64 now = (U64)stm_ms(stm_now());
+  if (now - a->sync.last_announce_ms >= 250) {
+    osync_announce(&a->sync, a->sync.role == Osync_role_master,
+                   a->is_playing, (I32)a->bpm, (U32)a->tick_num,
+                   a->rate_num, a->rate_den, false);
   }
 }
 
@@ -1830,17 +2039,25 @@ staticni void ged_set_playing(Ged *a, bool playing) {
     a->clock = stm_now();
     a->midi_bclock_sixths = 0;
     // dumb'n'dirty, get us close to the next step time, but not quite
-    a->accum_secs = 60.0 / (double)a->bpm / 4.0;
+    a->accum_secs = ged_frame_secs(a);
     if (a->midi_bclock) {
       send_midi_byte(a->oosc_dev, &a->midi_mode, 0xFA); // "start"
       a->accum_secs /= 6.0;
     }
     a->accum_secs -= 0.0001;
     send_control_message(a->oosc_dev, "/orca/started");
+    if (a->sync_enabled)
+      osync_announce(&a->sync, a->sync.role == Osync_role_master, playing,
+                     (I32)a->bpm, (U32)a->tick_num, a->rate_num, a->rate_den,
+                     false);
   } else {
     ged_stop_all_sustained_notes(a);
     a->is_playing = false;
     send_control_message(a->oosc_dev, "/orca/stopped");
+    if (a->sync_enabled)
+      osync_announce(&a->sync, a->sync.role == Osync_role_master, playing,
+                     (I32)a->bpm, (U32)a->tick_num, a->rate_num, a->rate_den,
+                     false);
     if (a->midi_bclock)
       send_midi_byte(a->oosc_dev, &a->midi_mode, 0xFC); // "stop"
   }
@@ -1982,6 +2199,7 @@ enum {
   Set_soft_margins_form_id,
   Set_fancy_grid_dots_menu_id,
   Set_fancy_grid_rulers_menu_id,
+  Rate_menu_id,
 #ifdef FEAT_PORTMIDI
   Portmidi_output_device_menu_id,
 #endif
@@ -2118,12 +2336,35 @@ static void push_osc_output_port_form(char const *initial) {
 }
 enum {
   Playback_menu_midi_bclock = 1,
+  Playback_menu_rate,
 };
+static void push_rate_menu(void);
 static void push_playback_menu(bool midi_bclock_enabled) {
   Qmenu *qm = qmenu_create(Playback_menu_id);
   qmenu_set_title(qm, "Clock & Timing");
   qmenu_add_printf(qm, Playback_menu_midi_bclock, "[%c] Send MIDI Beat Clock",
                    midi_bclock_enabled ? '*' : ' ');
+  qmenu_add_choice(qm, Playback_menu_rate, "Tempo Multiplier...");
+  qmenu_push_to_nav(qm);
+}
+
+enum {
+  Rate_menu_quarter = 1,
+  Rate_menu_half,
+  Rate_menu_normal,
+  Rate_menu_double,
+  Rate_menu_triple,
+  Rate_menu_quadruple,
+};
+static void push_rate_menu(void) {
+  Qmenu *qm = qmenu_create(Rate_menu_id);
+  qmenu_set_title(qm, "Tempo Multiplier");
+  qmenu_add_choice(qm, Rate_menu_quarter, "1/4 speed (quarter time)");
+  qmenu_add_choice(qm, Rate_menu_half, "1/2 speed");
+  qmenu_add_choice(qm, Rate_menu_normal, "Normal speed (1x)");
+  qmenu_add_choice(qm, Rate_menu_double, "Double speed (2x)");
+  qmenu_add_choice(qm, Rate_menu_triple, "Triple speed (3x)");
+  qmenu_add_choice(qm, Rate_menu_quadruple, "Quadruple speed (4x)");
   qmenu_push_to_nav(qm);
 }
 static void push_about_msg(void) {
@@ -2196,6 +2437,7 @@ static void push_controls_msg(void) {
       {"Escape", "Return to Normal Mode or Deselect"},
       {"( ) _ + [ ] { }", "Adjust Grid Size and Rulers"},
       {"< and >", "Adjust BPM"},
+      {"F2..F7", "Tempo Multiplier (1/4 .. 4x)"},
       {"?", "Controls (this message)"},
   };
   int w_input = 0;
@@ -2513,6 +2755,10 @@ typedef struct {
   bool strict_timing;
   bool osc_output_enabled;
   bool fancy_grid_dots, fancy_grid_rulers;
+  oso *sync_addr, *sync_port;
+  bool sync_enabled;
+  bool sync_multicast;
+  bool sync_error;
 } Tui;
 
 ORCA_OK_IF_UNUSED staticni void print_loading_message(char const *s) {
@@ -3025,7 +3271,37 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
           tui_save_prefs(t);
           break;
         }
+        case Playback_menu_rate:
+          push_rate_menu();
+          break;
         }
+        break;
+      case Rate_menu_id:
+        switch (act.picked.id) {
+        case Rate_menu_quarter:
+          ged_set_rate(&t->ged, 1, 4);
+          break;
+        case Rate_menu_half:
+          ged_set_rate(&t->ged, 1, 2);
+          break;
+        case Rate_menu_normal:
+          ged_set_rate(&t->ged, 1, 1);
+          break;
+        case Rate_menu_double:
+          ged_set_rate(&t->ged, 2, 1);
+          break;
+        case Rate_menu_triple:
+          ged_set_rate(&t->ged, 3, 1);
+          break;
+        case Rate_menu_quadruple:
+          ged_set_rate(&t->ged, 4, 1);
+          break;
+        }
+        // Dismiss only the multiplier submenu. The Clock & Timing menu is
+        // already on the stack beneath it and becomes active again; pushing a
+        // fresh one would stack duplicate menus.
+        qnav_stack_pop();
+        t->ged.is_draw_dirty = true;
         break;
       case Set_fancy_grid_dots_menu_id:
         plainorfancy_menu_was_picked(t, act.picked.id, &t->fancy_grid_dots,
@@ -3245,6 +3521,9 @@ enum {
   Argopt_seed,
   Argopt_portmidi_deprecated,
   Argopt_osc_deprecated,
+  Argopt_rate,
+  Argopt_sync,
+  Argopt_sync_multicast,
 };
 
 int main(int argc, char **argv) {
@@ -3262,10 +3541,14 @@ int main(int argc, char **argv) {
        Argopt_portmidi_deprecated},
       {"osc-server", required_argument, 0, Argopt_osc_deprecated},
       {"osc-port", required_argument, 0, Argopt_osc_deprecated},
+      {"rate", required_argument, 0, Argopt_rate},
+      {"sync", required_argument, 0, Argopt_sync},
+      {"sync-multicast", required_argument, 0, Argopt_sync_multicast},
       {NULL, 0, NULL, 0}};
   int init_bpm = 120;
   int init_seed = 1;
   int init_grid_dim_y = 25, init_grid_dim_x = 57;
+  int init_rate_num = 1, init_rate_den = 1;
   bool explicit_initial_grid_size = false;
 
   Tui t = {.file_name = NULL}; // Weird because of clang warning
@@ -3344,6 +3627,45 @@ int main(int argc, char **argv) {
           "Options --osc-server and --osc-port have been removed.\n"
           "Instead, set the OSC server and port from within the ORCA menu.\n");
       exit(1);
+    case Argopt_rate: {
+      int num = 1, den = 1;
+      if (sscanf(optarg, "%d/%d", &num, &den) == 2) {
+        // fraction form
+      } else if (sscanf(optarg, "%d", &num) == 1) {
+        den = 1;
+      } else {
+        OPTFAIL("Expected a whole number or a fraction like 3/2.");
+      }
+      if (num < 1 || den < 1)
+        OPTFAIL("Both parts of the ratio must be 1 or greater.");
+      init_rate_num = num;
+      init_rate_den = den;
+      break;
+    }
+    case Argopt_sync:
+    case Argopt_sync_multicast: {
+      // Split "addr:port" without modifying the terminal's argv.
+      Usz len = strlen(optarg);
+      char *buf = (char *)malloc(len + 1);
+      if (!buf) {
+        fprintf(stderr, "Out of memory.\n");
+        exit(1);
+      }
+      memcpy(buf, optarg, len + 1);
+      char *colon = strrchr(buf, ':');
+      if (!colon || colon == buf || colon[1] == '\0') {
+        fprintf(stderr, "Expected an address and port, like 127.0.0.1:9999\n");
+        free(buf);
+        exit(1);
+      }
+      *colon = '\0';
+      osoput(&t.sync_addr, buf);
+      osoput(&t.sync_port, colon + 1);
+      t.sync_enabled = true;
+      t.sync_multicast = c == Argopt_sync_multicast;
+      free(buf);
+      break;
+    }
     }
   }
 #undef OPTFAIL
@@ -3361,7 +3683,35 @@ int main(int argc, char **argv) {
     midi_mode_deinit(&t.ged.midi_mode);
     midi_mode_init_osc_bidule(&t.ged.midi_mode, osoc(t.osc_midi_bidule_path));
   }
-  stm_setup(); // Set up timer lib
+  stm_setup(); // Set up timer lib before sync records its start time.
+  // Apply the requested tempo multiplier before the transport starts, so the
+  // first frame already uses it.
+  if (init_rate_num != 1 || init_rate_den != 1) {
+    t.ged.rate_num = init_rate_num;
+    t.ged.rate_den = init_rate_den;
+  }
+  if (t.sync_enabled && osolen(t.sync_addr) && osolen(t.sync_port)) {
+    // Bind to the given address/port. For unicast we bind to the exact
+    // address, so only local peers reach us and the kernel does not split the
+    // stream between processes. For multicast we join the group on the port
+    // instead, so any instance on the machine or LAN can participate.
+    bool ok = osync_init(&t.ged.sync, 0 /* self id assigned below */,
+                         osoc(t.sync_addr), osoc(t.sync_port), osoc(t.sync_addr),
+                         osoc(t.sync_port), t.sync_multicast);
+    if (ok) {
+      // A stable, non-zero id so an instance can ignore its own multicast
+      // loopback. Derived from the pid, which is unique among live instances.
+      t.ged.sync.self_id = (U32)getpid() | 1u;
+      t.ged.sync_enabled = true;
+      // Announce immediately so an already-running master hears us, and we
+      // hear its reply.
+      osync_announce(&t.ged.sync, t.ged.sync.role == Osync_role_master,
+                     t.ged.is_playing, (I32)t.ged.bpm, 0, t.ged.rate_num,
+                     t.ged.rate_den, true);
+    } else {
+      t.sync_error = true;
+    }
+  }
   // Enable UTF-8 by explicitly initializing our locale before initializing
   // ncurses. Only needed (maybe?) if using libncursesw/wide-chars or UTF-8.
   // Using it unguarded will mess up box drawing chars in Linux virtual
@@ -3447,6 +3797,11 @@ int main(int argc, char **argv) {
                             t.ged.field.width);
   ged_make_cursor_visible(&t.ged);
   ged_send_osc_bpm(&t.ged, (I32)t.ged.bpm); // Send initial BPM
+  if (t.sync_error) {
+    qmsg_printf_push("Sync Error", "Could not open the sync socket at %s:%s.",
+                     osoc(t.sync_addr), osoc(t.sync_port));
+    t.sync_error = false;
+  }
   ged_set_playing(&t.ged, true);            // Auto-play
   // Enter main loop. Process events as they arrive.
 event_loop:;
@@ -3457,6 +3812,7 @@ event_loop:;
   }
   switch (key) {
   case ERR: { // ERR indicates no more events.
+    ged_sync_poll(&t.ged);
     ged_do_stuff(&t.ged);
     bool drew_any = false;
     if (ged_is_draw_dirty(&t.ged) || qnav_stack.occlusion_dirty) {
@@ -3680,6 +4036,27 @@ event_loop:;
     break;
   case '>':
     ged_adjust_bpm(&t.ged, 1);
+    break;
+  // Tempo multiplier shortcuts. F-keys are used because bare digits are
+  // needed for typing into the grid and Ctrl+<digit> collides with existing
+  // Ctrl+q/r/u/v/s bindings (they share control codes).
+  case KEY_F(2):
+    ged_set_rate(&t.ged, 1, 4); // quarter speed
+    break;
+  case KEY_F(3):
+    ged_set_rate(&t.ged, 1, 2); // half speed
+    break;
+  case KEY_F(4):
+    ged_set_rate(&t.ged, 1, 1); // normal speed
+    break;
+  case KEY_F(5):
+    ged_set_rate(&t.ged, 2, 1); // double
+    break;
+  case KEY_F(6):
+    ged_set_rate(&t.ged, 3, 1); // triple
+    break;
+  case KEY_F(7):
+    ged_set_rate(&t.ged, 4, 1); // quadruple
     break;
   case CTRL_PLUS('f'):
     ged_input_cmd(&t.ged, Ged_input_cmd_step_forward);
