@@ -3,29 +3,41 @@
 #include <ctype.h>
 #include <form.h>
 
+static bool rgb_cursors_active = false;
+// Fixed xterm-256 cube entries. These are not theme ANSI slots, so a
+// grayscale+yellow theme cannot collapse them into one color.
+static short const cursor_color_idx[Cursor_rgb_count] = {
+    167, 179, 187, 114, 116, 74, 103, 140, 175, 101,
+};
+
+static short rgb_pair(unsigned slot) {
+  // Keep pair IDs small: COLOR_PAIR only has 9 bits on many ncurses builds.
+  return (short)(1 + Colors_count * Colors_count + slot % Cursor_rgb_count);
+}
+
+
+attr_t term_util_rgb_cursor(unsigned slot) {
+  return rgb_cursors_active ? COLOR_PAIR(rgb_pair(slot)) : 0;
+}
+
+
 void term_util_init_colors() {
-  if (has_colors()) {
-    // Enable color
-    start_color();
-    use_default_colors();
-    for (int ifg = 0; ifg < Colors_count; ++ifg) {
-      for (int ibg = 0; ibg < Colors_count; ++ibg) {
-        int res = init_pair((short int)(1 + ifg * Colors_count + ibg),
-                            (short int)(ifg - 1), (short int)(ibg - 1));
-        (void)res;
-        // Might fail on Linux virtual console/terminal for a couple of colors.
-        // Just ignore.
-#if 0
-        if (res == ERR) {
-          endwin();
-          fprintf(stderr, "Error initializing color pair: %d %d\n", ifg - 1,
-                  ibg - 1);
-          exit(1);
-        }
-#endif
-      }
+  if (!has_colors())
+    return;
+  start_color();
+  use_default_colors();
+  for (int ifg = 0; ifg < Colors_count; ++ifg) {
+    for (int ibg = 0; ibg < Colors_count; ++ibg) {
+      int res = init_pair((short int)(1 + ifg * Colors_count + ibg),
+                          (short int)(ifg - 1), (short int)(ibg - 1));
+      (void)res;
     }
   }
+  if (COLORS <= 255)
+    return;
+  for (unsigned i = 0; i < Cursor_rgb_count; ++i)
+    init_pair(rgb_pair(i), cursor_color_idx[i], -1);
+  rgb_cursors_active = true;
 }
 
 #define ORCA_CONTAINER_OF(ptr, type, member)                                   \

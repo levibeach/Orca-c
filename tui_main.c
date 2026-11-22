@@ -58,6 +58,13 @@ fprintf(stderr,
 "                           Like --sync, but join a multicast group so\n"
 "                           instances on the same machine or LAN find each\n"
 "                           other automatically. Example: 239.255.0.1:9999\n"
+"    --name <string>        Name shown in the shared-grid cursor legend.\n"
+"                           Default: P1, P2, ... by join order.\n"
+"    --color <1-8>          Preferred cursor color slot (1-8).\n"
+"                           Uses fixed 256-color entries when available,\n"
+"                           theme colors otherwise. Collisions are reassigned.\n"
+"    --edit-mode <mode>     master (default): only the master can edit cells.\n"
+"                           open: everyone applies and broadcasts edits.\n"
 "    -h or --help           Print this message and exit.\n"
 "\n"
 "OSC/MIDI options:\n"
@@ -124,7 +131,9 @@ static attr_t term_attrs_of_cell(Glyph g, Mark m) {
     attr = A_bold | fg_bg(C_red, C_natural);
     break;
   case Glyph_class_grid:
-    attr = A_bold | fg_bg(C_black, C_natural);
+    // Empty cells are drawn in the terminal's own foreground at half
+    // intensity. A hardcoded black dot disappears on any dark theme.
+    attr = A_dim | Cdef_normal;
     break;
   case Glyph_class_comment:
     attr = A_dim | Cdef_normal;
@@ -195,12 +204,100 @@ static void ged_cursor_move_relative(Ged_cursor *tc, Usz field_h, Usz field_w,
   tc->x = (Usz)x0;
 }
 
+// Cursor colors use fixed 256-color entries where available, with a palette
+// fallback. Ten slots cover ten simultaneous players.
+enum { Cursor_style_count = 10, Cursor_map_max = 10 };
+typedef struct {
+  Color_name color;
+  attr_t attrs;
+} Cursor_style;
+
+static Cursor_style const cursor_styles[Cursor_style_count] = {
+    {C_blue, A_bold | A_reverse},    {C_magenta, A_bold | A_reverse},
+    {C_cyan, A_bold | A_reverse},    {C_white, A_bold | A_reverse},
+    {C_black, A_bold | A_reverse},   {C_red, A_bold | A_reverse},
+    {C_green, A_bold | A_reverse},   {C_yellow, A_bold | A_reverse},
+    {C_blue, A_bold | A_reverse},    {C_magenta, A_bold | A_reverse},
+};
+
+staticni attr_t cursor_color_attr(U8 style) {
+  U8 s = style % Cursor_style_count;
+  attr_t rgb = term_util_rgb_cursor(s);
+  return rgb ? rgb : fg_bg(cursor_styles[s].color, C_natural);
+}
+
+staticni attr_t cursor_attr_for(U8 style) {
+  return A_bold | A_reverse | cursor_color_attr(style);
+}
+
+typedef struct {
+  U32 id;
+  U8 style;
+} Cursor_slot;
+
+typedef struct {
+  Cursor_slot slots[Cursor_map_max];
+  Usz n;
+} Cursor_map;
+
+staticni U8 cursor_style_of(Cursor_map const *m, U32 id) {
+  for (Usz i = 0; i < m->n; ++i)
+    if (m->slots[i].id == id)
+      return m->slots[i].style;
+  return 0;
+}
+
+staticni Cursor_map cursor_build_map(U32 self_id, U8 self_color,
+                                     Osync const *sync) {
+  typedef struct {
+    U32 id;
+    U8 color;
+  } Candidate;
+  Candidate cand[Cursor_map_max];
+  Usz n = 0;
+  cand[n++] = (Candidate){self_id, self_color};
+  if (sync) {
+    for (Osync_peer const *p = osync_peers(sync); p && n < Cursor_map_max;
+         p = p->next) {
+    Usz y, x, h, w;
+    char const *name = NULL;
+    if (osync_peer_cursor(sync, p->id, &y, &x, &h, &w, &name))
+      cand[n++] = (Candidate){p->id, p->color};
+    }
+  }
+  for (Usz i = 1; i < n; ++i) {
+    Candidate c = cand[i];
+    Usz j = i;
+    while (j && cand[j - 1].id > c.id) {
+      cand[j] = cand[j - 1];
+      --j;
+    }
+    cand[j] = c;
+  }
+  bool used[Cursor_style_count] = {false};
+  Cursor_map map = {0};
+  for (Usz i = 0; i < n; ++i) {
+    U8 preferred = cand[i].color ? (U8)((cand[i].color - 1) % Cursor_style_count) : 0;
+    U8 style = preferred;
+    for (Usz k = 0; k < Cursor_style_count; ++k) {
+      Usz j = ((Usz)preferred + k) % Cursor_style_count;
+      if (!used[j]) {
+        style = (U8)j;
+        break;
+      }
+    }
+    used[style] = true;
+    map.slots[map.n++] = (Cursor_slot){cand[i].id, style};
+  }
+  return map;
+}
+
 staticni void draw_grid_cursor(WINDOW *win, int draw_y, int draw_x, int draw_h,
                                int draw_w, Glyph const *gbuffer, Usz field_h,
                                Usz field_w, int scroll_y, int scroll_x,
                                Usz cursor_y, Usz cursor_x, Usz cursor_h,
                                Usz cursor_w, Ged_input_mode input_mode,
-                               bool is_playing) {
+                               bool is_playing, attr_t curs_attr) {
   (void)input_mode;
   if (cursor_y >= field_h || cursor_x >= field_w)
     return;
@@ -218,7 +315,7 @@ staticni void draw_grid_cursor(WINDOW *win, int draw_y, int draw_x, int draw_h,
     return;
   if (draw_y >= draw_h || draw_x >= draw_w)
     return;
-  attr_t const curs_attr = A_reverse | A_bold | fg_bg(C_yellow, C_natural);
+  // curs_attr is supplied by the caller so RGB and palette styles agree.
   if (offset_y <= cursor_y && offset_x <= cursor_x) {
     Usz cdraw_y = cursor_y - offset_y + (Usz)draw_y;
     Usz cdraw_x = cursor_x - offset_x + (Usz)draw_x;
@@ -415,7 +512,7 @@ staticni void print_activity_indicator(WINDOW *win, Usz activity_counter) {
   Usz val = activity_counter % states;
   chtype lamps[Colors];
 #if 1 // Appearance where segments are always lit
-  lamps[0] = ACS_HLINE | fg_bg(C_black, C_natural) | A_bold;
+  lamps[0] = ACS_HLINE | A_dim;
   lamps[1] = ACS_HLINE | fg_bg(C_white, C_natural) | A_normal;
   lamps[2] = ACS_HLINE | A_bold;
   lamps[3] = lamps[1];
@@ -596,6 +693,87 @@ staticni void draw_glyphs_grid(WINDOW *win, int draw_y, int draw_x, int draw_h,
     wmove(win, draw_y + (int)iy, draw_x);
     waddchnstr(win, chbuffer, (int)cols);
   }
+}
+
+// Remote cursors tint the cell under them without hiding its glyph. An empty
+// cell shows a '+'; a filled cell keeps its character. The color maps to the
+// peer legend, so names do not have to fit in one grid cell.
+staticni void draw_remote_cursors(WINDOW *win, int draw_y, int draw_x,
+                                  int draw_h, int draw_w,
+                                  Glyph const *gbuffer, Usz field_h,
+                                  Usz field_w, int scroll_y, int scroll_x,
+                                  Osync const *sync, Cursor_map const *styles) {
+  if (!sync)
+    return;
+  if (scroll_y < 0) {
+    draw_y += -scroll_y;
+    scroll_y = 0;
+  }
+  if (scroll_x < 0) {
+    draw_x += -scroll_x;
+    scroll_x = 0;
+  }
+  for (Osync_peer const *p = osync_peers(sync); p; p = p->next) {
+    Usz y, x, h, w;
+    char const *name = NULL;
+    if (!osync_peer_cursor(sync, p->id, &y, &x, &h, &w, &name))
+      continue;
+    if (y >= field_h || x >= field_w)
+      continue;
+    int cy = (int)y - scroll_y + draw_y;
+    int cx = (int)x - scroll_x + draw_x;
+    if (cy < 0 || cx < 0 || cy >= draw_h || cx >= draw_w)
+      continue;
+    attr_t attr = cursor_attr_for(cursor_style_of(styles, p->id));
+    Glyph beneath = gbuffer[y * field_w + x];
+    chtype ch = (chtype)(beneath == '.' ? '+' : beneath) | attr;
+    wmove(win, cy, cx);
+    waddchnstr(win, &ch, 1);
+  }
+}
+
+// Peer names on the right of the second HUD line, each in its chosen color.
+staticni void draw_peer_legend(WINDOW *win, int win_y, int win_x, int width,
+                               Osync const *sync, Cursor_map const *styles) {
+  if (!sync || width < 10)
+    return;
+  Usz avail = (Usz)width - 2;
+  typedef struct {
+    char name[Osync_name_max];
+    U8 style;
+  } Legend_name;
+  Legend_name names[Cursor_map_max];
+  Usz n = 0, total = 0;
+  for (Osync_peer const *p = osync_peers(sync); p && n < Cursor_map_max;
+       p = p->next) {
+    Usz y, x, h, w;
+    char const *name = NULL;
+    if (!osync_peer_cursor(sync, p->id, &y, &x, &h, &w, &name))
+      continue;
+    Usz room = avail - total - (n ? 1 : 0);
+    if (!room)
+      break;
+    Usz len = strlen(name);
+    if (len > room)
+      len = room;
+    memcpy(names[n].name, name, len);
+    names[n].name[len] = 0;
+    names[n].style = cursor_style_of(styles, p->id) % Cursor_style_count;
+    total += len + (n ? 1 : 0);
+    ++n;
+  }
+  if (!n)
+    return;
+  wmove(win, win_y + 1, win_x + width - 2 - (int)total);
+  for (Usz i = 0; i < n; ++i) {
+    if (i) {
+      wattrset(win, A_normal);
+      waddstr(win, " ");
+    }
+    wattrset(win, cursor_color_attr(names[i].style));
+    waddstr(win, names[i].name);
+  }
+  wattrset(win, A_normal);
 }
 
 staticni void draw_glyphs_grid_scrolled(
@@ -915,6 +1093,9 @@ typedef struct {
   // 3/2 etc. are exact. frame_secs = 60 / bpm / 4 / (rate_num / rate_den).
   I32 rate_num, rate_den;
   Osync sync;
+  U32 shared_snapshot_rev; // newest full grid snapshot applied from the master
+  Glyph *sync_prev_grid; // master's grid before the last VM step
+  Usz sync_prev_h, sync_prev_w;
   Oosc_dev *oosc_dev;
   Midi_mode midi_mode;
   Usz activity_counter;
@@ -938,6 +1119,15 @@ typedef struct {
   bool sync_aligned : 1; // adopted the master's frame phase once this session
   bool sync_waiting_bar : 1; // holding playback until the master's next downbeat
 } Ged;
+
+// Master mode is view-only for non-masters; open mode lets anyone edit.
+staticni bool ged_can_edit(Ged const *a) {
+  if (!a->sync_enabled)
+    return true;
+  if (a->sync.edit_mode == Osync_edit_mode_open)
+    return true;
+  return a->sync.role == Osync_role_master;
+}
 
 static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   field_init(&a->field);
@@ -963,6 +1153,8 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   midi_mode_init_null(&a->midi_mode);
   a->activity_counter = 0;
   a->random_seed = init_seed;
+  a->sync_prev_grid = NULL;
+  a->sync_prev_h = a->sync_prev_w = 0;
   a->drag_start_y = a->drag_start_x = 0;
   a->win_h = a->win_w = 0;
   a->softmargin_y = a->softmargin_x = 0;
@@ -997,6 +1189,7 @@ static void ged_deinit(Ged *a) {
     oosc_dev_destroy(a->oosc_dev);
   midi_mode_deinit(&a->midi_mode);
   osync_deinit(&a->sync);
+  free(a->sync_prev_grid);
 }
 
 static bool ged_is_draw_dirty(Ged *a) {
@@ -1372,6 +1565,46 @@ staticni void clear_and_run_vm(Glyph *restrict gbuf, Mark *restrict mbuf,
   orca_run(gbuf, mbuf, height, width, tick_number, oevent_list, random_seed);
 }
 
+staticni void ged_broadcast_cell(Ged *a, Usz y, Usz x, Glyph g);
+// The master runs the VM locally; broadcast the cells it changes so followers
+// mirror program output frame by frame instead of running their own divergent
+// copy of the simulation.
+staticni void sync_capture_prev_grid(Ged *a) {
+  if (!a->sync_enabled || (a->sync.role != Osync_role_master &&
+                           a->sync.edit_mode != Osync_edit_mode_open))
+    return;
+  Usz h = a->field.height, w = a->field.width;
+  if (!h || !w || h > SIZE_MAX / w)
+    return;
+  Usz cells = h * w;
+  if (a->sync_prev_h != h || a->sync_prev_w != w) {
+    Glyph *prev = (Glyph *)realloc(a->sync_prev_grid, cells * sizeof *prev);
+    if (!prev)
+      return;
+    a->sync_prev_grid = prev;
+    a->sync_prev_h = h;
+    a->sync_prev_w = w;
+  }
+  memcpy(a->sync_prev_grid, a->field.buffer, cells * sizeof(Glyph));
+}
+
+staticni void sync_broadcast_sim_changes(Ged *a) {
+  if (!a->sync_enabled ||
+      (a->sync.role != Osync_role_master &&
+       a->sync.edit_mode != Osync_edit_mode_open) ||
+      !a->sync_prev_grid || a->sync_prev_h != a->field.height ||
+      a->sync_prev_w != a->field.width)
+    return;
+  for (Usz y = 0; y < a->field.height; ++y) {
+    for (Usz x = 0; x < a->field.width; ++x) {
+      Usz i = y * a->field.width + x;
+      if (a->field.buffer[i] != a->sync_prev_grid[i])
+        ged_broadcast_cell(a, y, x, a->field.buffer[i]);
+    }
+  }
+}
+
+
 staticni void ged_do_stuff(Ged *a) {
   // A fresh follower holds its first frames until the master reaches a bar
   // boundary, so it comes in on the downbeat rather than at boot time.
@@ -1431,9 +1664,11 @@ staticni void ged_do_stuff(Ged *a) {
                                 &a->susnote_list, &a->time_to_next_note_off);
   // The sustained-note duration is derived from frame_secs, so a rate change
   // automatically re-scales notes already sounding. See send_output_events.
+  sync_capture_prev_grid(a);
   clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
                    a->field.width, a->tick_num, &a->oevent_list,
                    a->random_seed);
+  sync_broadcast_sim_changes(a);
   ++a->tick_num;
   a->needs_remarking = true;
   a->is_draw_dirty = true;
@@ -1546,11 +1781,19 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
       win, 0, 0, a->grid_h, win_w, a->field.buffer, a->mbuf_r.buffer,
       a->field.height, a->field.width, a->grid_scroll_y, a->grid_scroll_x,
       a->ruler_spacing_y, a->ruler_spacing_x, use_fancy_dots, use_fancy_rulers);
+  Cursor_map cursor_map =
+      cursor_build_map(a->sync.self_id, a->sync.self_color,
+                       a->sync_enabled ? &a->sync : NULL);
+  attr_t self_attr = cursor_attr_for(cursor_style_of(&cursor_map, a->sync.self_id));
+  draw_remote_cursors(win, 0, 0, a->grid_h, win_w, a->field.buffer,
+                      a->field.height, a->field.width, a->grid_scroll_y,
+                      a->grid_scroll_x, a->sync_enabled ? &a->sync : NULL,
+                      &cursor_map);
   draw_grid_cursor(win, 0, 0, a->grid_h, win_w, a->field.buffer,
                    a->field.height, a->field.width, a->grid_scroll_y,
                    a->grid_scroll_x, a->ged_cursor.y, a->ged_cursor.x,
                    a->ged_cursor.h, a->ged_cursor.w, a->input_mode,
-                   a->is_playing);
+                   a->is_playing, self_attr);
   if (a->is_hud_visible) {
     filename = filename ? filename : "unnamed";
     int hud_x = win_w > 50 + a->softmargin_x * 2 ? a->softmargin_x : 0;
@@ -1559,6 +1802,8 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
              a->ruler_spacing_x, a->tick_num, a->bpm, a->rate_num,
              a->rate_den, &a->ged_cursor, a->input_mode,
              a->activity_counter);
+    draw_peer_legend(win, a->grid_h, hud_x, win_w,
+                     a->sync_enabled ? &a->sync : NULL, &cursor_map);
   }
   if (a->draw_event_list)
     draw_oevent_list(win, &a->oevent_list);
@@ -1645,12 +1890,131 @@ staticni void ged_sync_apply(Ged *a) {
     ged_set_playing(a, playing);
 }
 
+staticni bool ged_try_selection_clipped_to_field(Ged const *a, Usz *out_y,
+                                                 Usz *out_x, Usz *out_h,
+                                                 Usz *out_w);
+
+// The master exposes its canonical grid to sync.c for periodic snapshots.
+static void ged_grid_provider(void *user, char const **buf, Usz *len, Usz *w,
+                              Usz *h) {
+  Ged *a = (Ged *)user;
+  *buf = a->field.buffer;
+  *len = (Usz)a->field.height * a->field.width;
+  *w = a->field.width;
+  *h = a->field.height;
+}
+
+// Master mode sends follower edits to the master for revision and rebroadcast;
+// open mode broadcasts each edit directly and every peer applies it locally.
+staticni void ged_broadcast_cell(Ged *a, Usz y, Usz x, Glyph g) {
+  if (!a->sync_enabled)
+    return;
+  if (a->sync.edit_mode == Osync_edit_mode_open) {
+    osync_open_cell_edit(&a->sync, y, x, g);
+  } else if (a->sync.role == Osync_role_follower) {
+    osync_send_cell_edit(&a->sync, y, x, g);
+  } else if (a->sync.role == Osync_role_master) {
+    osync_master_cell_edit(&a->sync, y, x, g);
+  }
+}
+
+staticni void ged_broadcast_selection(Ged *a, Glyph g) {
+  Usz y, x, h, w;
+  if (!a->sync_enabled ||
+      !ged_try_selection_clipped_to_field(a, &y, &x, &h, &w))
+    return;
+  for (Usz iy = 0; iy < h; ++iy)
+    for (Usz ix = 0; ix < w; ++ix)
+      ged_broadcast_cell(a, y + iy, x + ix, g);
+}
+
+staticni void ged_remote_edit(Ged *a, Osync_edit const *e) {
+  if (e->y >= a->field.height || e->x >= a->field.width)
+    return;
+  // Remote edits can arrive dozens per frame; don't flood the undo history.
+  gbuffer_poke(a->field.buffer, a->field.height, a->field.width, e->y, e->x,
+               e->glyph);
+  a->needs_remarking = true;
+  a->is_draw_dirty = true;
+}
+
+// Assemble a full-grid snapshot from bounded chunks. Ignore older revisions
+// and incomplete sets; the master resends every two seconds.
+staticni void ged_apply_snapshot(Ged *a, Osync_chunk const *chunks, Usz n) {
+  if (!n)
+    return;
+  U32 rev = 0;
+  for (Usz i = 0; i < n; ++i)
+    if (chunks[i].rev > rev)
+      rev = chunks[i].rev;
+  if (rev <= a->shared_snapshot_rev)
+    return;
+  U32 count = 0;
+  Usz w = 0, h = 0;
+  for (Usz i = 0; i < n; ++i) {
+    if (chunks[i].rev != rev)
+      continue;
+    if (!count) {
+      count = chunks[i].count;
+      w = chunks[i].width;
+      h = chunks[i].height;
+    }
+  }
+  if (!count || !w || !h || w > SIZE_MAX / h)
+    return;
+  Usz cells = w * h;
+  char *buf = (char *)malloc(cells);
+  bool *have = (bool *)calloc(count, sizeof(bool));
+  if (!buf || !have) {
+    free(buf);
+    free(have);
+    return;
+  }
+  for (Usz i = 0; i < n; ++i) {
+    Osync_chunk const *c = &chunks[i];
+    if (c->rev != rev || c->index >= count || have[c->index])
+      continue;
+    Usz off = (Usz)c->index * Osync_chunk_cells;
+    if (off >= cells)
+      continue;
+    Usz ncopy = c->n < cells - off ? c->n : cells - off;
+    memcpy(buf + off, c->glyphs, ncopy);
+    have[c->index] = true;
+  }
+  bool complete = true;
+  for (U32 i = 0; i < count; ++i)
+    complete = complete && have[i];
+  free(have);
+  if (complete) {
+    if (a->field.height != h || a->field.width != w)
+      ged_resize_grid(&a->field, &a->mbuf_r, h, w, a->tick_num,
+                      &a->scratch_field, &a->undo_hist, &a->ged_cursor);
+    memcpy(a->field.buffer, buf, cells);
+    a->shared_snapshot_rev = rev;
+    a->needs_remarking = true;
+    a->is_draw_dirty = true;
+  }
+  free(buf);
+}
+
 // Called once per main-loop iteration. Polls the sync socket and, if anything
 // changed locally, re-aligns the clock and marks the display dirty.
 staticni void ged_sync_poll(Ged *a) {
   if (!a->sync_enabled)
     return;
   bool changed = osync_poll(&a->sync);
+  // Shared grid: every participant sees the master's edits and cursors.
+  osync_set_cursor(&a->sync, a->ged_cursor.y, a->ged_cursor.x, a->ged_cursor.h,
+                   a->ged_cursor.w);
+  Osync_edit edits[Osync_edit_queue_max];
+  Usz n_edits = osync_poll_edits(&a->sync, edits, ORCA_ARRAY_COUNTOF(edits));
+  for (Usz i = 0; i < n_edits; ++i)
+    ged_remote_edit(a, &edits[i]);
+  Osync_chunk chunks[Osync_chunk_queue_max];
+  Usz n_chunks = osync_poll_chunks(&a->sync, chunks, ORCA_ARRAY_COUNTOF(chunks));
+  ged_apply_snapshot(a, chunks, n_chunks);
+  if (n_edits || n_chunks)
+    changed = true;
 
   // A newly started follower holds its frames until the master is at the
   // start of a bar, then adopts the master's frame counter once. That makes
@@ -1770,6 +2134,8 @@ staticni bool ged_try_selection_clipped_to_field(Ged const *a, Usz *out_y,
 }
 
 staticni bool ged_slide_selection(Ged *a, int delta_y, int delta_x) {
+  if (!ged_can_edit(a))
+    return false;
   Usz curs_y_0, curs_x_0, curs_h_0, curs_w_0;
   Usz curs_y_1, curs_x_1, curs_h_1, curs_w_1;
   if (!ged_try_selection_clipped_to_field(a, &curs_y_0, &curs_x_0, &curs_h_0,
@@ -1986,6 +2352,8 @@ staticni void ged_adjust_rulers_relative(Ged *a, Isz delta_y, Isz delta_x) {
 }
 
 staticni void ged_resize_grid_relative(Ged *a, Isz delta_y, Isz delta_x) {
+  if (!ged_can_edit(a))
+    return;
   ged_resize_grid_snap_ruler(&a->field, &a->mbuf_r, a->ruler_spacing_y,
                              a->ruler_spacing_x, delta_y, delta_x, a->tick_num,
                              &a->scratch_field, &a->undo_hist, &a->ged_cursor);
@@ -1996,9 +2364,12 @@ staticni void ged_resize_grid_relative(Ged *a, Isz delta_y, Isz delta_x) {
 }
 
 staticni void ged_write_character(Ged *a, char c) {
+  if (!ged_can_edit(a))
+    return;
   undo_history_push(&a->undo_hist, &a->field, a->tick_num);
   gbuffer_poke(a->field.buffer, a->field.height, a->field.width,
                a->ged_cursor.y, a->ged_cursor.x, c);
+  ged_broadcast_cell(a, a->ged_cursor.y, a->ged_cursor.x, c);
   // Indicate we want the next simulation step to be run predictavely,
   // so that we can use the reulsting mark buffer for UI visualization.
   // This is "expensive", so it could be skipped for non-interactive
@@ -2012,12 +2383,15 @@ staticni void ged_write_character(Ged *a, char c) {
 }
 
 staticni bool ged_fill_selection_with_char(Ged *a, Glyph c) {
+  if (!ged_can_edit(a))
+    return false;
   Usz curs_y, curs_x, curs_h, curs_w;
   if (!ged_try_selection_clipped_to_field(a, &curs_y, &curs_x, &curs_h,
                                           &curs_w))
     return false;
   gbuffer_fill_subrect(a->field.buffer, a->field.height, a->field.width, curs_y,
                        curs_x, curs_h, curs_w, c);
+  ged_broadcast_selection(a, c);
   return true;
 }
 
@@ -2114,6 +2488,8 @@ staticni void ged_set_playing(Ged *a, bool playing) {
 staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
   switch (ev) {
   case Ged_input_cmd_undo:
+    if (!ged_can_edit(a))
+      break;
     if (undo_history_count(&a->undo_hist) == 0)
       break;
     if (a->is_playing)
@@ -2145,6 +2521,8 @@ staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
     a->is_draw_dirty = true;
     break;
   case Ged_input_cmd_step_forward:
+    if (!ged_can_edit(a))
+      break;
     undo_history_push(&a->undo_hist, &a->field, a->tick_num);
     clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
                      a->field.width, a->tick_num, &a->oevent_list,
@@ -2162,6 +2540,8 @@ staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
     a->is_draw_dirty = true;
     break;
   case Ged_input_cmd_cut:
+    if (!ged_can_edit(a))
+      break;
     if (ged_copy_selection_to_clipbard(a)) {
       undo_history_push(&a->undo_hist, &a->field, a->tick_num);
       ged_fill_selection_with_char(a, '.');
@@ -2173,6 +2553,8 @@ staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
     ged_copy_selection_to_clipbard(a);
     break;
   case Ged_input_cmd_paste: {
+    if (!ged_can_edit(a))
+      break;
     Usz field_h = a->field.height;
     Usz field_w = a->field.width;
     Usz curs_y = a->ged_cursor.y;
@@ -2194,6 +2576,11 @@ staticni void ged_input_cmd(Ged *a, Ged_input_cmd ev) {
     gbuffer_copy_subrect(cb_field->buffer, a->field.buffer, cbfield_h,
                          cbfield_w, field_h, field_w, 0, 0, curs_y, curs_x,
                          cpy_h, cpy_w);
+    for (Usz iy = 0; iy < cpy_h; ++iy)
+      for (Usz ix = 0; ix < cpy_w; ++ix)
+        ged_broadcast_cell(
+            a, curs_y + iy, curs_x + ix,
+            a->field.buffer[(curs_y + iy) * field_w + curs_x + ix]);
     a->ged_cursor.h = cpy_h;
     a->ged_cursor.w = cpy_w;
     a->needs_remarking = true;
@@ -2247,6 +2634,7 @@ enum {
   Set_fancy_grid_dots_menu_id,
   Set_fancy_grid_rulers_menu_id,
   Rate_menu_id,
+  Edit_mode_menu_id,
 #ifdef FEAT_PORTMIDI
   Portmidi_output_device_menu_id,
 #endif
@@ -2260,6 +2648,10 @@ enum {
   Confirm_new_file_accept_id,
 };
 enum {
+  Edit_mode_master_id = 1,
+  Edit_mode_open_id,
+};
+enum {
   Main_menu_quit = 1,
   Main_menu_controls,
   Main_menu_opers_guide,
@@ -2270,6 +2662,7 @@ enum {
   Main_menu_set_tempo,
   Main_menu_set_grid_dims,
   Main_menu_autofit_grid,
+  Main_menu_edit_mode,
   Main_menu_about,
   Main_menu_cosmetics,
   Main_menu_playback,
@@ -2290,6 +2683,7 @@ static void push_main_menu(void) {
   qmenu_add_choice(qm, Main_menu_set_tempo, "Set BPM...");
   qmenu_add_choice(qm, Main_menu_set_grid_dims, "Set Grid Size...");
   qmenu_add_choice(qm, Main_menu_autofit_grid, "Auto-fit Grid");
+  qmenu_add_choice(qm, Main_menu_edit_mode, "Shared Editing...");
   qmenu_add_spacer(qm);
   qmenu_add_choice(qm, Main_menu_osc, "OSC Output...");
 #ifdef FEAT_PORTMIDI
@@ -2327,6 +2721,16 @@ static void push_autofit_menu(void) {
   qmenu_set_title(qm, "Auto-fit Grid");
   qmenu_add_choice(qm, Autofit_nicely_id, "Nicely");
   qmenu_add_choice(qm, Autofit_tightly_id, "Tightly");
+  qmenu_push_to_nav(qm);
+}
+
+static void push_edit_mode_menu(U8 mode) {
+  Qmenu *qm = qmenu_create(Edit_mode_menu_id);
+  qmenu_set_title(qm, "Shared Editing");
+  qmenu_add_choice(qm, Edit_mode_master_id, "Master controls cells");
+  qmenu_add_choice(qm, Edit_mode_open_id, "Everyone edits");
+  qmenu_set_current_item(qm, mode == Osync_edit_mode_open ? Edit_mode_open_id
+                                                         : Edit_mode_master_id);
   qmenu_push_to_nav(qm);
 }
 
@@ -2805,6 +3209,9 @@ typedef struct {
   oso *sync_addr, *sync_port;
   bool sync_enabled;
   bool sync_multicast;
+  char sync_name[Osync_name_max];
+  U8 sync_color;
+  U8 sync_edit_mode; // Osync_edit_mode default from --edit-mode
   bool sync_error;
 } Tui;
 
@@ -3186,6 +3593,9 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         case Main_menu_playback:
           push_playback_menu(t->ged.midi_bclock);
           break;
+        case Main_menu_edit_mode:
+          push_edit_mode_menu(t->ged.sync.edit_mode);
+          break;
         case Main_menu_cosmetics:
           push_cosmetics_menu();
           break;
@@ -3217,9 +3627,13 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
           push_set_tempo_form(t->ged.bpm);
           break;
         case Main_menu_set_grid_dims:
+          if (!ged_can_edit(&t->ged))
+            break;
           push_set_grid_dims_form(t->ged.field.height, t->ged.field.width);
           break;
         case Main_menu_autofit_grid:
+          if (!ged_can_edit(&t->ged))
+            break;
           push_autofit_menu();
           break;
 #ifdef FEAT_PORTMIDI
@@ -3230,6 +3644,8 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         }
         break;
       case Autofit_menu_id: {
+        if (!ged_can_edit(&t->ged))
+          break;
         Usz new_field_h, new_field_w;
         bool did_get_ok_size = false;
         switch (act.picked.id) {
@@ -3255,6 +3671,18 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         pop_qnav_if_main_menu();
         break;
       }
+      case Edit_mode_menu_id:
+        osync_set_edit_mode(
+            &t->ged.sync,
+            act.picked.id == Edit_mode_open_id ? Osync_edit_mode_open
+                                               : Osync_edit_mode_master);
+        osync_announce(&t->ged.sync, t->ged.sync.role == Osync_role_master,
+                       t->ged.is_playing, (I32)t->ged.bpm, 0, t->ged.rate_num,
+                       t->ged.rate_den, (U32)t->ged.grid_wall_ms, false);
+        t->ged.is_draw_dirty = true;
+        qnav_stack_pop();
+        pop_qnav_if_main_menu();
+        break;
       case Confirm_new_file_menu_id:
         switch (act.picked.id) {
         case Confirm_new_file_reject_id:
@@ -3571,6 +3999,9 @@ enum {
   Argopt_rate,
   Argopt_sync,
   Argopt_sync_multicast,
+  Argopt_name,
+  Argopt_color,
+  Argopt_edit_mode,
 };
 
 int main(int argc, char **argv) {
@@ -3591,6 +4022,9 @@ int main(int argc, char **argv) {
       {"rate", required_argument, 0, Argopt_rate},
       {"sync", required_argument, 0, Argopt_sync},
       {"sync-multicast", required_argument, 0, Argopt_sync_multicast},
+      {"name", required_argument, 0, Argopt_name},
+      {"color", required_argument, 0, Argopt_color},
+      {"edit-mode", required_argument, 0, Argopt_edit_mode},
       {NULL, 0, NULL, 0}};
   int init_bpm = 120;
   int init_seed = 1;
@@ -3713,6 +4147,24 @@ int main(int argc, char **argv) {
       free(buf);
       break;
     }
+    case Argopt_name:
+      snprintf(t.sync_name, sizeof t.sync_name, "%s", optarg);
+      break;
+    case Argopt_color: {
+      long v = strtol(optarg, NULL, 10);
+      if (v < 1 || v >= Colors_count)
+        OPTFAIL("Expected a color from 1 to 8.");
+      t.sync_color = (U8)v;
+      break;
+    }
+    case Argopt_edit_mode:
+      if (!strcmp(optarg, "master"))
+        t.sync_edit_mode = Osync_edit_mode_master;
+      else if (!strcmp(optarg, "open"))
+        t.sync_edit_mode = Osync_edit_mode_open;
+      else
+        OPTFAIL("Expected master or open.");
+      break;
     }
   }
 #undef OPTFAIL
@@ -3747,9 +4199,15 @@ int main(int argc, char **argv) {
                          osoc(t.sync_port), t.sync_multicast);
     if (ok) {
       // A stable, non-zero id so an instance can ignore its own multicast
-      // loopback. Derived from the pid, which is unique among live instances.
-      t.ged.sync.self_id = (U32)getpid() | 1u;
+      // loopback. Shift before setting the low bit: getpid() | 1 collides for
+      // consecutive pids (13184 and 13185 both become 13185).
+      t.ged.sync.self_id = ((U32)getpid() << 1) | 1u;
       t.ged.sync_enabled = true;
+      // Shared-grid identity: --name/--color are what other users see in the
+      // cursor legend; osync generates a default name if none was given.
+      osync_set_identity(&t.ged.sync, t.sync_name, t.sync_color);
+      osync_set_edit_mode(&t.ged.sync, t.sync_edit_mode);
+      osync_set_grid_provider(&t.ged.sync, ged_grid_provider, &t.ged);
       // Announce immediately so an already-running master hears us, and we
       // hear its reply.
       osync_announce(&t.ged.sync, t.ged.sync.role == Osync_role_master,
@@ -3989,7 +4447,7 @@ event_loop:;
         ++brackpaste_y;
         goto event_loop;
       }
-      if (key != ' ') {
+      if (key != ' ' && ged_can_edit(&t.ged)) {
         char cleaned = (char)key;
         if (!orca_is_valid_glyph((Glyph)key))
           cleaned = '.';

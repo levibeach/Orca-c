@@ -50,6 +50,11 @@ static ORCA_FORCEINLINE ORCA_OK_IF_UNUSED attr_t fg_bg(Color_name fg,
 
 void term_util_init_colors(void);
 
+// Ten fixed 256-color entries for cursors and peer names. These bypass the
+// theme's ANSI palette; terminals with only 8 colors fall back to theme pairs.
+enum { Cursor_rgb_count = 10 };
+attr_t term_util_rgb_cursor(unsigned slot);
+
 typedef enum {
   Qblock_type_qmsg,
   Qblock_type_qmenu,
