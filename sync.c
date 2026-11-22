@@ -45,6 +45,23 @@ static bool path_is(char const *path, Usz path_len, char const *want) {
   return path_len == want_len && memcmp(path, want, path_len) == 0;
 }
 
+// Resolve a numeric or named IPv4 address to network byte order. Returns
+// false for hostnames that resolve only to IPv6.
+static bool resolve_ipv4(char const *name, U32 *out_addr) {
+  if (!name)
+    return false;
+  struct addrinfo hints = {0};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  struct addrinfo *res = NULL;
+  if (getaddrinfo(name, NULL, &hints, &res) != 0 || !res)
+    return false;
+  struct sockaddr_in const *sin = (struct sockaddr_in const *)res->ai_addr;
+  *out_addr = sin->sin_addr.s_addr;
+  freeaddrinfo(res);
+  return true;
+}
+
 static void peer_remove(Osync *s, Osync_peer *victim) {
   Osync_peer **link = &s->peers;
   while (*link) {
@@ -84,10 +101,17 @@ bool osync_init(Osync *s, U32 self_id, char const *bind_addr,
   Oosc_udp_create_error oe;
   bool bound = false;
 
+  // Remember where discovery packets should go. Unicast sweeps the configured
+  // address; multicast sends to the group via the device's default target.
+  if (!resolve_ipv4(daddr, &s->target_ip))
+    s->target_ip = htonl(INADDR_LOOPBACK);
+
   if (multicast) {
-    // All instances share the group's port. Bind the wildcard address, since
-    // the group address is not local and cannot be bound on every platform.
-    oe = oosc_dev_create_udp_ex(&s->dev, daddr, dport, NULL, 1, &err, true);
+    // Bind the wildcard address on the group's port. Passing NULL here skips
+    // the bind entirely in oosc_dev_create_udp_ex(), leaving the socket on a
+    // random port -- which is why multicast sync never worked.
+    oe = oosc_dev_create_udp_ex(&s->dev, daddr, dport, "0.0.0.0", 1, &err,
+                                true);
     if (oe == Oosc_udp_create_error_ok) {
       s->port = s->port_base;
       bound = true;
@@ -123,28 +147,29 @@ bool osync_init(Osync *s, U32 self_id, char const *bind_addr,
   }
 
   if (multicast) {
-    // Join the group so we receive what is sent to it.
+    // Join the group so this socket receives datagrams addressed to it. Use
+    // the same resolved address for the group and for sends; the previous
+    // code re-resolved bind_addr but ignored failures, so a bad group left a
+    // bound socket that could never receive anything.
     struct ip_mreq mreq;
     memset(&mreq, 0, sizeof mreq);
-    struct addrinfo hints = {0};
-    struct addrinfo *res = NULL;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(bind_addr, NULL, &hints, &res) == 0 && res) {
-      struct sockaddr_in const *sin = (struct sockaddr_in const *)res->ai_addr;
-      mreq.imr_multiaddr = sin->sin_addr;
-      mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-      if (setsockopt(oosc_dev_fd(s->dev), IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                     &mreq, sizeof mreq) < 0) {
-        // Not fatal; unicast peers may still reach us.
-      }
-      // Loopback is on by default; make it explicit so two instances on one
-      // machine see each other.
-      unsigned char loop = 1;
-      setsockopt(oosc_dev_fd(s->dev), IPPROTO_IP, IP_MULTICAST_LOOP, &loop,
-                 sizeof loop);
-      freeaddrinfo(res);
+    mreq.imr_multiaddr.s_addr = s->target_ip;
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(oosc_dev_fd(s->dev), IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
+                   sizeof mreq) < 0) {
+      oosc_dev_destroy(s->dev);
+      s->dev = NULL;
+      return false;
     }
+    // Keep local loopback delivery on: two instances on this machine should
+    // see each other through the group.
+    unsigned char loop = 1;
+    setsockopt(oosc_dev_fd(s->dev), IPPROTO_IP, IP_MULTICAST_LOOP, &loop,
+               sizeof loop);
+    // Default is 1, but set it explicitly so LAN delivery is not surprising.
+    unsigned char ttl = 1;
+    setsockopt(oosc_dev_fd(s->dev), IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
+               sizeof ttl);
   }
 
   s->enabled = true;
@@ -282,9 +307,7 @@ void osync_announce(Osync *s, bool is_master, bool playing, I32 bpm,
       memset(&to, 0, sizeof to);
       to.sin_family = AF_INET;
       to.sin_port = htons(port);
-      to.sin_addr.s_addr = inet_addr("127.0.0.1");
-      if (to.sin_addr.s_addr == INADDR_NONE)
-        continue;
+      to.sin_addr.s_addr = s->target_ip;
       send_state(s, path, is_master, playing, bpm, tick_low, rate_num, rate_den,
                  grid_ms_low, (struct sockaddr const *)&to, sizeof to);
     }

@@ -59,6 +59,7 @@ typedef struct Osync {
   U16 port;
   U16 port_base;
   bool multicast;
+  U32 target_ip; // network-order IPv4 used for the unicast discovery sweep
   Osync_peer *peers;
 } Osync;
 

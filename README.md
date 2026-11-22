@@ -205,16 +205,22 @@ and play/pause state. The frame counter then runs locally, because a 2x
 follower necessarily advances through frames twice as fast. If the master
 exits, a follower takes over.
 
-For instances on different machines, or to avoid coordinating ports, use a
-multicast group instead; every instance then finds the others automatically:
+For instances on the same LAN, or to avoid coordinating ports, use a multicast
+group instead. All instances join one group and share its port:
 
 ```sh
 build/orca --sync-multicast 239.255.0.1:9999
 ```
 
-`--sync` binds the given port for the first instance and walks upward
-(`9999`, `10000`, ...) for each additional one, since two sockets sharing one
-port would have their incoming traffic divided between them.
+Multicast requires a network that forwards group traffic; packets are sent with
+TTL 1, so they cross a local subnet but not a router. Local loopback delivery
+is enabled, so two instances on the same machine sync through the group too.
+This path was verified on one machine; cross-machine behaviour depends on your
+network's multicast configuration.
+
+`--sync` works on one machine: the first instance binds the given port, then
+each additional one takes the next free port (`9999`, `10000`, ...), since two
+ordinary UDP sockets sharing one port would split its incoming traffic.
 
 ## Tempo multipliers
 
