@@ -8,8 +8,8 @@ Orca is not a synthesizer, but a flexible livecoding environment capable of send
 
 <img src='https://raw.githubusercontent.com/wiki/hundredrabbits/Orca-c/PREVIEW.jpg' width='600'/>
 
-| Main git repo | GitHub mirror |
-| ------------- | ------------- |
+| Main git repo                                              | GitHub mirror                                                                |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | [git.sr.ht/~rabbits/orca](https://git.sr.ht/~rabbits/orca) | [github.com/hundredrabbits/Orca-c](https://github.com/hundredrabbits/Orca-c) |
 
 ## Quick Start for Debian/Raspbian (Raspberry Pi)
@@ -122,6 +122,10 @@ General options:
                            Like --sync, but join a multicast group so
                            instances on the same machine or LAN find each
                            other automatically. Example: 239.255.0.1:9999
+    --name <string>        Name shown in the shared-grid cursor legend.
+                           Default: user-<pid>
+    --color <1-8>          Color for your cursor and legend entry.
+                           1=black, 2=red, ... 8=white. Default: 0 (natural)
     -h or --help           Print this message and exit.
 
 OSC/MIDI options:
@@ -167,7 +171,7 @@ $ build/orca                             # run orca
 │           Escape  Return to Normal Mode or Deselect │
 │  ( ) _ + [ ] { }  Adjust Grid Size and Rulers       │
 │          < and >  Adjust BPM                        │
-│          F2..F7  Tempo Multiplier (1/4..4x)         │
+│           F2..F7  Tempo Multiplier (1/4..4x)        │
 │                ?  Controls (this message)           │
 └─────────────────────────────────────────────────────┘
 ```
@@ -181,6 +185,7 @@ cli [-t timesteps] infile
 ```
 
 You can also make `cli` read from stdin:
+
 ```sh
 echo -e "...\na34\n..." | cli /dev/stdin
 ```
@@ -222,6 +227,36 @@ network's multicast configuration.
 each additional one takes the next free port (`9999`, `10000`, ...), since two
 ordinary UDP sockets sharing one port would split its incoming traffic.
 
+### Shared grid
+
+`--sync` also mirrors the grid itself. Give each instance a name and color so
+other users can identify your cursor:
+
+```sh
+build/orca --sync 127.0.0.1:9999 --name alice --color 2   # master
+build/orca --sync 127.0.0.1:9999 --name bob   --color 4   # follower
+```
+
+The first instance is the master and owns the canonical grid. In master mode
+only the master can change cells; in open mode all participants can. Each
+cursor is a reverse-video block in a fixed
+256-color slot where the terminal supports it, so a grayscale/yellow theme
+cannot make every user look the same; peers with the same `--color` get
+different slots. The second HUD line lists connected peers by name in their
+chosen colors.
+
+By default only the master can edit cells; followers are view-only. Use
+`--edit-mode open`, or the main menu's `Shared Editing` item and choose
+`Everyone edits`, to let every participant apply and broadcast edits directly.
+The mode is announced to peers and carried on every edit; mixed-mode edits are
+rejected. Use the same mode on every instance.
+
+The master snapshots the full grid every two seconds, so an instance that joins
+late or loses packets converges to the current grid. Run all instances with
+the same `--rate` and `--seed` for identical simulation between snapshots.
+Resize the grid only on the master; followers adopt its dimensions from the
+next snapshot.
+
 ## Tempo multipliers
 
 Each instance has a local tempo multiplier applied on top of the shared BPM.
@@ -231,14 +266,14 @@ against the same beat without fighting over the clock.
 Set it at startup with `--rate` (a whole number or a fraction), change it while
 playing with `F2`–`F7`, or pick from `Clock & Timing -> Tempo Multiplier`:
 
-| Key | Menu | Multiplier |
-|---|---|---|
-| `F2` | 1/4 speed (quarter time) | 1/4 |
-| `F3` | 1/2 speed | 1/2 |
-| `F4` | Normal speed (1x) | 1 |
-| `F5` | Double speed (2x) | 2 |
-| `F6` | Triple speed (3x) | 3 |
-| `F7` | Quadruple speed (4x) | 4 |
+| Key  | Menu                     | Multiplier |
+| ---- | ------------------------ | ---------- |
+| `F2` | 1/4 speed (quarter time) | 1/4        |
+| `F3` | 1/2 speed                | 1/2        |
+| `F4` | Normal speed (1x)        | 1          |
+| `F5` | Double speed (2x)        | 2          |
+| `F6` | Triple speed (3x)        | 3          |
+| `F7` | Quadruple speed (4x)     | 4          |
 
 The current multiplier is shown next to the BPM in the HUD, for example
 `120 2x`. Note durations scale with it, since they are derived from the frame
