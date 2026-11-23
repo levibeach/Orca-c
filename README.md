@@ -237,25 +237,29 @@ build/orca --sync 127.0.0.1:9999 --name alice --color 2   # master
 build/orca --sync 127.0.0.1:9999 --name bob   --color 4   # follower
 ```
 
-The first instance is the master and owns the canonical grid. In master mode
-only the master can change cells; in open mode all participants can. Each
-cursor is a reverse-video block in a fixed
+The first instance is the master and owns the canonical grid. The three edit
+modes are `strict` (master only), `protected` (follower edits go through the
+master), and `open` (everyone edits directly). Each cursor is a reverse-video
+block in a fixed
 256-color slot where the terminal supports it, so a grayscale/yellow theme
 cannot make every user look the same; peers with the same `--color` get
 different slots. The second HUD line lists connected peers by name in their
 chosen colors.
 
-By default only the master can edit cells; followers are view-only. The master
-uses `--edit-mode open`, or the main menu's `Shared Editing` item and chooses
-`Everyone edits`, to let every participant apply and broadcast edits directly.
-The mode is announced to peers and carried on every edit; mixed-mode edits are
-rejected, and only the master can change the mode.
+The default mode is `protected`. The master uses `--edit-mode <mode>`, or the
+main menu's `Share` item, to switch between `strict`, `protected`, and
+`open`. The mode is announced to peers and carried on every edit; mixed-mode
+edits are rejected, and only the master can change the mode.
 
 The master snapshots the full grid every two seconds, so an instance that joins
 late or loses packets converges to the current grid. Run all instances with
 the same `--rate` and `--seed` for identical simulation between snapshots.
 Resize the grid only on the master; followers adopt its dimensions from the
 next snapshot.
+
+Use `--sync-tempo` to join the same tempo and transport without sharing the
+grid. That instance keeps its own cells and ignores grid edits and snapshots;
+its local `--rate` and `--seed` still apply.
 
 ## Tempo multipliers
 
