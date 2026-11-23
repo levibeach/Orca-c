@@ -291,5 +291,5 @@ shifting the beat by a fraction of a frame.
 ## Extras
 
 - Discuss and get help in the [forum thread](https://llllllll.co/t/orca-live-coding-tool/17689).
-- Support this project through [Patreon](https://patreon.com/100).
+- Support this project through [Patreon](https://patreon.com/hundredrabbits).
 - See the [License](LICENSE.md) (MIT) file for license rights and limitations.
