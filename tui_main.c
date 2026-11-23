@@ -773,7 +773,7 @@ staticni void draw_peer_legend(WINDOW *win, int win_y, int win_x, int width,
       wattrset(win, A_normal);
       waddstr(win, " ");
     }
-    wattrset(win, cursor_color_attr(names[i].style));
+    wattrset(win, (int)cursor_color_attr(names[i].style));
     waddstr(win, names[i].name);
   }
   wattrset(win, A_normal);
