@@ -134,9 +134,9 @@ static attr_t term_attrs_of_cell(Glyph g, Mark m) {
     attr = A_bold | fg_bg(C_red, C_natural);
     break;
   case Glyph_class_grid:
-    // Empty cells are drawn in the terminal's own foreground at half
-    // intensity. A hardcoded black dot disappears on any dark theme.
-    attr = A_dim | Cdef_normal;
+    // Explicit muted gray avoids a bright-white dot on terminals that ignore
+    // A_DIM. Falls back to A_DIM on 8-color terminals.
+    attr = term_util_dim_dot_attr();
     break;
   case Glyph_class_comment:
     attr = A_dim | Cdef_normal;
@@ -1934,6 +1934,25 @@ staticni void ged_broadcast_selection(Ged *a, Glyph g) {
       ged_broadcast_cell(a, y + iy, x + ix, g);
 }
 
+// Broadcast the current glyphs of a field rectangle. Used for mutations that
+// rewrite a region with several different glyphs, such as sliding a selection.
+staticni void ged_broadcast_field_rect(Ged *a, Usz y, Usz x, Usz h, Usz w) {
+  if (!a->sync_enabled || !a->sync_grid_shared || !h || !w)
+    return;
+  for (Usz iy = 0; iy < h; ++iy) {
+    Usz cy = y + iy;
+    if (cy >= a->field.height)
+      break;
+    for (Usz ix = 0; ix < w; ++ix) {
+      Usz cx = x + ix;
+      if (cx >= a->field.width)
+        break;
+      ged_broadcast_cell(a, cy, cx,
+                         a->field.buffer[cy * a->field.width + cx]);
+    }
+  }
+}
+
 staticni void ged_remote_edit(Ged *a, Osync_edit const *e) {
   if (e->y >= a->field.height || e->x >= a->field.width)
     return;
@@ -2189,6 +2208,15 @@ staticni bool ged_slide_selection(Ged *a, int delta_y, int delta_x) {
                        curs_w_0, '.');
   gbuffer_fill_subrect(a->field.buffer, field_h, field_w, curs_y_0, ex,
                        curs_h_0, ew, '.');
+  // The copy and the two erase fills can touch the whole union of the old and
+  // new selection rectangles. Broadcast those cells so peers see the move.
+  Usz ub_y = curs_y_0 < curs_y_1 ? curs_y_0 : curs_y_1;
+  Usz ub_x = curs_x_0 < curs_x_1 ? curs_x_0 : curs_x_1;
+  Usz u_end_y0 = curs_y_0 + curs_h_0, u_end_y1 = curs_y_1 + curs_h_1;
+  Usz u_end_x0 = curs_x_0 + curs_w_0, u_end_x1 = curs_x_1 + curs_w_1;
+  Usz ub_end_y = u_end_y0 > u_end_y1 ? u_end_y0 : u_end_y1;
+  Usz ub_end_x = u_end_x0 > u_end_x1 ? u_end_x0 : u_end_x1;
+  ged_broadcast_field_rect(a, ub_y, ub_x, ub_end_y - ub_y, ub_end_x - ub_x);
   a->needs_remarking = true;
   return true;
 }

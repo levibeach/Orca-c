@@ -45,7 +45,7 @@ typedef enum {
 
 // A default 73x17 grid is ~20 chunks; keep room for substantially larger ones
 // so a complete snapshot can be assembled in one pass.
-enum { Osync_name_max = 24, Osync_edit_queue_max = 64, Osync_chunk_cells = 64, Osync_chunk_queue_max = 256 };
+enum { Osync_name_max = 24, Osync_edit_queue_max = 64, Osync_chunk_cells = 64, Osync_chunk_queue_max = 256, Osync_seen_edit_max = 64 };
 
 typedef struct Osync_peer {
   U32 id;
@@ -99,6 +99,11 @@ typedef struct Osync {
   // recover without a request/ack handshake.
   U32 grid_rev;
   U32 last_edit_seq;
+  // Master-side dedup is per author: each follower numbers its own requests
+  // from 1, so a single global counter would reject the first edit from every
+  // follower after the first as a duplicate.
+  struct { U32 author, seq; } seen_edits[Osync_seen_edit_max];
+  Usz seen_edit_head, seen_edit_len;
   // Snapshot provider, installed by the editor. Returns a pointer to a
   // row-major glyph buffer valid for the duration of the send.
   void (*grid_provider)(void *user, char const **buf, Usz *len, Usz *w, Usz *h);

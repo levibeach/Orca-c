@@ -4,6 +4,7 @@
 #include <form.h>
 
 static bool rgb_cursors_active = false;
+static bool dim_dot_active = false;
 // Fixed xterm-256 cube entries. These are not theme ANSI slots, so a
 // grayscale+yellow theme cannot collapse them into one color.
 static short const cursor_color_idx[Cursor_rgb_count] = {
@@ -18,6 +19,15 @@ static short rgb_pair(unsigned slot) {
 
 attr_t term_util_rgb_cursor(unsigned slot) {
   return rgb_cursors_active ? COLOR_PAIR(rgb_pair(slot)) : 0;
+}
+
+static short dim_dot_pair(void) {
+  return (short)(1 + Colors_count * Colors_count + Cursor_rgb_count);
+}
+
+attr_t term_util_dim_dot_attr(void) {
+  // Fixed xterm gray 238 (#444) stays subtle on terminals that ignore A_DIM.
+  return dim_dot_active ? COLOR_PAIR(dim_dot_pair()) : (A_DIM | Cdef_normal);
 }
 
 
@@ -38,6 +48,9 @@ void term_util_init_colors() {
   for (unsigned i = 0; i < Cursor_rgb_count; ++i)
     init_pair(rgb_pair(i), cursor_color_idx[i], -1);
   rgb_cursors_active = true;
+  if (COLOR_PAIRS > dim_dot_pair() &&
+      init_pair(dim_dot_pair(), 238, -1) != ERR)
+    dim_dot_active = true;
 }
 
 #define ORCA_CONTAINER_OF(ptr, type, member)                                   \

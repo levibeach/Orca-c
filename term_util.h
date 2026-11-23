@@ -55,6 +55,10 @@ void term_util_init_colors(void);
 enum { Cursor_rgb_count = 10 };
 attr_t term_util_rgb_cursor(unsigned slot);
 
+// Explicit muted gray for empty grid cells. A_DIM alone is ignored by some
+// Linux terminals, leaving a bright white dot.
+attr_t term_util_dim_dot_attr(void);
+
 typedef enum {
   Qblock_type_qmsg,
   Qblock_type_qmenu,

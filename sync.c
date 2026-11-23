@@ -524,6 +524,29 @@ static void edit_enqueue(Osync *s, U32 author, U32 rev, Usz y, Usz x,
   ++s->edit_queue_len;
 }
 
+// Master-side duplicate detection must be per author. Followers each number
+// their own requests from 1; one shared counter silently drops the first edit
+// from every follower after the first.
+static bool seen_edit(Osync *s, U32 author, U32 seq) {
+  for (Usz i = 0; i < s->seen_edit_len; ++i) {
+    Usz slot = (s->seen_edit_head + i) % Osync_seen_edit_max;
+    if (s->seen_edits[slot].author == author && s->seen_edits[slot].seq == seq)
+      return true;
+  }
+  return false;
+}
+
+static void remember_edit(Osync *s, U32 author, U32 seq) {
+  if (s->seen_edit_len == Osync_seen_edit_max) {
+    s->seen_edit_head = (s->seen_edit_head + 1) % Osync_seen_edit_max;
+    --s->seen_edit_len;
+  }
+  Usz slot = (s->seen_edit_head + s->seen_edit_len) % Osync_seen_edit_max;
+  s->seen_edits[slot].author = author;
+  s->seen_edits[slot].seq = seq;
+  ++s->seen_edit_len;
+}
+
 static void chunk_enqueue(Osync *s, U32 rev, U32 index, U32 count, Usz w,
                           Usz h, char const *packed, Usz n) {
   if (n > Osync_chunk_cells)
@@ -597,9 +620,10 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
       return false;
     }
     if (s->role == Osync_role_master) {
-      if (seq != 0 && seq <= s->last_edit_seq)
+      if (seq != 0 && seen_edit(s, author, seq))
         return false; // duplicate delivery of the same request
-      s->last_edit_seq = seq;
+      if (seq != 0)
+        remember_edit(s, author, seq);
       edit_enqueue(s, author, ++s->grid_rev, (Usz)vals[3], (Usz)vals[4],
                    (char)vals[5]);
       I32 out[8] = {(I32)s->grid_rev, (I32)s->self_id, (I32)author, vals[3],
