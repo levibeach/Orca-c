@@ -63,9 +63,11 @@ fprintf(stderr,
 "    --color <1-8>          Preferred cursor color slot (1-8).\n"
 "                           Uses fixed 256-color entries when available,\n"
 "                           theme colors otherwise. Collisions are reassigned.\n"
-"    --edit-mode <mode>     master (default): only the master can edit cells.\n"
+"    --edit-mode <mode>     strict: only the master can edit cells.\n"
+"                           protected (default): edits go through the master.\n"
 "                           open: everyone applies and broadcasts edits.\n"
 "                           The master changes the mode for the whole group.\n"
+"    --sync-tempo           Share BPM/transport only; keep this grid private.\n"
 "    -h or --help           Print this message and exit.\n"
 "\n"
 "OSC/MIDI options:\n"
@@ -1095,6 +1097,7 @@ typedef struct {
   I32 rate_num, rate_den;
   Osync sync;
   U32 shared_snapshot_rev; // newest full grid snapshot applied from the master
+  bool sync_grid_shared;
   Glyph *sync_prev_grid; // master's grid before the last VM step
   Usz sync_prev_h, sync_prev_w;
   Oosc_dev *oosc_dev;
@@ -1121,11 +1124,11 @@ typedef struct {
   bool sync_waiting_bar : 1; // holding playback until the master's next downbeat
 } Ged;
 
-// Master mode is view-only for non-masters; open mode lets anyone edit.
+// strict is view-only for followers; protected and open let everyone edit.
 staticni bool ged_can_edit(Ged const *a) {
   if (!a->sync_enabled)
     return true;
-  if (a->sync.edit_mode == Osync_edit_mode_open)
+  if (a->sync.edit_mode != Osync_edit_mode_strict)
     return true;
   return a->sync.role == Osync_role_master;
 }
@@ -1171,6 +1174,7 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->is_mouse_dragging = false;
   a->is_hud_visible = false;
   a->sync_enabled = false;
+  a->sync_grid_shared = true;
   a->sync_changed = false;
   memset(&a->sync, 0, sizeof a->sync);
   a->sync_aligned = false;
@@ -1567,12 +1571,12 @@ staticni void clear_and_run_vm(Glyph *restrict gbuf, Mark *restrict mbuf,
 }
 
 staticni void ged_broadcast_cell(Ged *a, Usz y, Usz x, Glyph g);
-// The master runs the VM locally; broadcast the cells it changes so followers
-// mirror program output frame by frame instead of running their own divergent
-// copy of the simulation.
+// Diff the grid around each VM step and broadcast changed cells, so peers
+// mirror program output frame by frame instead of diverging locally.
 staticni void sync_capture_prev_grid(Ged *a) {
-  if (!a->sync_enabled || (a->sync.role != Osync_role_master &&
-                           a->sync.edit_mode != Osync_edit_mode_open))
+  if (!a->sync_enabled || !a->sync_grid_shared ||
+      (a->sync.role != Osync_role_master &&
+       a->sync.edit_mode != Osync_edit_mode_open))
     return;
   Usz h = a->field.height, w = a->field.width;
   if (!h || !w || h > SIZE_MAX / w)
@@ -1590,7 +1594,7 @@ staticni void sync_capture_prev_grid(Ged *a) {
 }
 
 staticni void sync_broadcast_sim_changes(Ged *a) {
-  if (!a->sync_enabled ||
+  if (!a->sync_enabled || !a->sync_grid_shared ||
       (a->sync.role != Osync_role_master &&
        a->sync.edit_mode != Osync_edit_mode_open) ||
       !a->sync_prev_grid || a->sync_prev_h != a->field.height ||
@@ -1782,14 +1786,14 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
       win, 0, 0, a->grid_h, win_w, a->field.buffer, a->mbuf_r.buffer,
       a->field.height, a->field.width, a->grid_scroll_y, a->grid_scroll_x,
       a->ruler_spacing_y, a->ruler_spacing_x, use_fancy_dots, use_fancy_rulers);
-  Cursor_map cursor_map =
-      cursor_build_map(a->sync.self_id, a->sync.self_color,
-                       a->sync_enabled ? &a->sync : NULL);
+  Cursor_map cursor_map = cursor_build_map(
+      a->sync.self_id, a->sync.self_color,
+      (a->sync_enabled && a->sync_grid_shared) ? &a->sync : NULL);
   attr_t self_attr = cursor_attr_for(cursor_style_of(&cursor_map, a->sync.self_id));
-  draw_remote_cursors(win, 0, 0, a->grid_h, win_w, a->field.buffer,
-                      a->field.height, a->field.width, a->grid_scroll_y,
-                      a->grid_scroll_x, a->sync_enabled ? &a->sync : NULL,
-                      &cursor_map);
+  if (a->sync_grid_shared)
+    draw_remote_cursors(win, 0, 0, a->grid_h, win_w, a->field.buffer,
+                        a->field.height, a->field.width, a->grid_scroll_y,
+                        a->grid_scroll_x, &a->sync, &cursor_map);
   draw_grid_cursor(win, 0, 0, a->grid_h, win_w, a->field.buffer,
                    a->field.height, a->field.width, a->grid_scroll_y,
                    a->grid_scroll_x, a->ged_cursor.y, a->ged_cursor.x,
@@ -1803,8 +1807,8 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
              a->ruler_spacing_x, a->tick_num, a->bpm, a->rate_num,
              a->rate_den, &a->ged_cursor, a->input_mode,
              a->activity_counter);
-    draw_peer_legend(win, a->grid_h, hud_x, win_w,
-                     a->sync_enabled ? &a->sync : NULL, &cursor_map);
+    if (a->sync_grid_shared)
+      draw_peer_legend(win, a->grid_h, hud_x, win_w, &a->sync, &cursor_map);
   }
   if (a->draw_event_list)
     draw_oevent_list(win, &a->oevent_list);
@@ -1905,14 +1909,15 @@ static void ged_grid_provider(void *user, char const **buf, Usz *len, Usz *w,
   *h = a->field.height;
 }
 
-// Master mode sends follower edits to the master for revision and rebroadcast;
-// open mode broadcasts each edit directly and every peer applies it locally.
+// strict publishes only master edits; protected routes follower requests
+// through the master; open broadcasts each edit directly.
 staticni void ged_broadcast_cell(Ged *a, Usz y, Usz x, Glyph g) {
-  if (!a->sync_enabled)
+  if (!a->sync_enabled || !a->sync_grid_shared)
     return;
   if (a->sync.edit_mode == Osync_edit_mode_open) {
     osync_open_cell_edit(&a->sync, y, x, g);
-  } else if (a->sync.role == Osync_role_follower) {
+  } else if (a->sync.edit_mode == Osync_edit_mode_protected &&
+             a->sync.role == Osync_role_follower) {
     osync_send_cell_edit(&a->sync, y, x, g);
   } else if (a->sync.role == Osync_role_master) {
     osync_master_cell_edit(&a->sync, y, x, g);
@@ -2004,18 +2009,21 @@ staticni void ged_sync_poll(Ged *a) {
   if (!a->sync_enabled)
     return;
   bool changed = osync_poll(&a->sync);
-  // Shared grid: every participant sees the master's edits and cursors.
-  osync_set_cursor(&a->sync, a->ged_cursor.y, a->ged_cursor.x, a->ged_cursor.h,
-                   a->ged_cursor.w);
-  Osync_edit edits[Osync_edit_queue_max];
-  Usz n_edits = osync_poll_edits(&a->sync, edits, ORCA_ARRAY_COUNTOF(edits));
-  for (Usz i = 0; i < n_edits; ++i)
-    ged_remote_edit(a, &edits[i]);
-  Osync_chunk chunks[Osync_chunk_queue_max];
-  Usz n_chunks = osync_poll_chunks(&a->sync, chunks, ORCA_ARRAY_COUNTOF(chunks));
-  ged_apply_snapshot(a, chunks, n_chunks);
-  if (n_edits || n_chunks)
-    changed = true;
+  if (a->sync_grid_shared)
+    osync_set_cursor(&a->sync, a->ged_cursor.y, a->ged_cursor.x,
+                     a->ged_cursor.h, a->ged_cursor.w);
+  if (a->sync_grid_shared) {
+    Osync_edit edits[Osync_edit_queue_max];
+    Usz n_edits = osync_poll_edits(&a->sync, edits, ORCA_ARRAY_COUNTOF(edits));
+    for (Usz i = 0; i < n_edits; ++i)
+      ged_remote_edit(a, &edits[i]);
+    Osync_chunk chunks[Osync_chunk_queue_max];
+    Usz n_chunks = osync_poll_chunks(&a->sync, chunks,
+                                     ORCA_ARRAY_COUNTOF(chunks));
+    ged_apply_snapshot(a, chunks, n_chunks);
+    if (n_edits || n_chunks)
+      changed = true;
+  }
 
   // A newly started follower holds its frames until the master is at the
   // start of a bar, then adopts the master's frame counter once. That makes
@@ -2649,7 +2657,8 @@ enum {
   Confirm_new_file_accept_id,
 };
 enum {
-  Edit_mode_master_id = 1,
+  Edit_mode_strict_id = 1,
+  Edit_mode_protected_id,
   Edit_mode_open_id,
 };
 enum {
@@ -2684,7 +2693,7 @@ static void push_main_menu(void) {
   qmenu_add_choice(qm, Main_menu_set_tempo, "Set BPM...");
   qmenu_add_choice(qm, Main_menu_set_grid_dims, "Set Grid Size...");
   qmenu_add_choice(qm, Main_menu_autofit_grid, "Auto-fit Grid");
-  qmenu_add_choice(qm, Main_menu_edit_mode, "Shared Editing...");
+  qmenu_add_choice(qm, Main_menu_edit_mode, "Share");
   qmenu_add_spacer(qm);
   qmenu_add_choice(qm, Main_menu_osc, "OSC Output...");
 #ifdef FEAT_PORTMIDI
@@ -2727,11 +2736,15 @@ static void push_autofit_menu(void) {
 
 static void push_edit_mode_menu(U8 mode) {
   Qmenu *qm = qmenu_create(Edit_mode_menu_id);
-  qmenu_set_title(qm, "Shared Editing");
-  qmenu_add_choice(qm, Edit_mode_master_id, "Master controls cells");
-  qmenu_add_choice(qm, Edit_mode_open_id, "Everyone edits");
-  qmenu_set_current_item(qm, mode == Osync_edit_mode_open ? Edit_mode_open_id
-                                                         : Edit_mode_master_id);
+  qmenu_set_title(qm, "Share");
+  qmenu_add_choice(qm, Edit_mode_strict_id, "Strict");
+  qmenu_add_choice(qm, Edit_mode_protected_id, "Protected");
+  qmenu_add_choice(qm, Edit_mode_open_id, "Open");
+  qmenu_set_current_item(qm, mode == Osync_edit_mode_open
+                                 ? Edit_mode_open_id
+                                 : mode == Osync_edit_mode_protected
+                                       ? Edit_mode_protected_id
+                                       : Edit_mode_strict_id);
   qmenu_push_to_nav(qm);
 }
 
@@ -3213,6 +3226,7 @@ typedef struct {
   char sync_name[Osync_name_max];
   U8 sync_color;
   U8 sync_edit_mode; // Osync_edit_mode default from --edit-mode
+  bool sync_tempo_only;
   bool sync_error;
 } Tui;
 
@@ -3674,13 +3688,16 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
       }
       case Edit_mode_menu_id:
         if (t->ged.sync_enabled && t->ged.sync.role != Osync_role_master) {
-          qmsg_printf_push("Shared Editing",
+          qmsg_printf_push("Share",
                            "Only the master can change this setting.");
         } else {
-          osync_set_edit_mode(
-              &t->ged.sync,
-              act.picked.id == Edit_mode_open_id ? Osync_edit_mode_open
-                                                 : Osync_edit_mode_master);
+          U8 new_mode =
+              act.picked.id == Edit_mode_open_id
+                  ? Osync_edit_mode_open
+                  : act.picked.id == Edit_mode_protected_id
+                        ? Osync_edit_mode_protected
+                        : Osync_edit_mode_strict;
+          osync_set_edit_mode(&t->ged.sync, new_mode);
           osync_announce(&t->ged.sync, t->ged.sync.role == Osync_role_master,
                          t->ged.is_playing, (I32)t->ged.bpm, 0, t->ged.rate_num,
                          t->ged.rate_den, (U32)t->ged.grid_wall_ms, false);
@@ -4008,6 +4025,7 @@ enum {
   Argopt_name,
   Argopt_color,
   Argopt_edit_mode,
+  Argopt_sync_tempo,
 };
 
 int main(int argc, char **argv) {
@@ -4031,6 +4049,7 @@ int main(int argc, char **argv) {
       {"name", required_argument, 0, Argopt_name},
       {"color", required_argument, 0, Argopt_color},
       {"edit-mode", required_argument, 0, Argopt_edit_mode},
+      {"sync-tempo", no_argument, 0, Argopt_sync_tempo},
       {NULL, 0, NULL, 0}};
   int init_bpm = 120;
   int init_seed = 1;
@@ -4045,6 +4064,7 @@ int main(int argc, char **argv) {
   t.use_gui_cboard = true;
   t.fancy_grid_dots = true;
   t.fancy_grid_rulers = true;
+  t.sync_edit_mode = Osync_edit_mode_protected;
 
   int longindex = 0;
   for (;;) {
@@ -4164,12 +4184,17 @@ int main(int argc, char **argv) {
       break;
     }
     case Argopt_edit_mode:
-      if (!strcmp(optarg, "master"))
-        t.sync_edit_mode = Osync_edit_mode_master;
+      if (!strcmp(optarg, "strict"))
+        t.sync_edit_mode = Osync_edit_mode_strict;
+      else if (!strcmp(optarg, "protected"))
+        t.sync_edit_mode = Osync_edit_mode_protected;
       else if (!strcmp(optarg, "open"))
         t.sync_edit_mode = Osync_edit_mode_open;
       else
-        OPTFAIL("Expected master or open.");
+        OPTFAIL("Expected strict, protected, or open.");
+      break;
+    case Argopt_sync_tempo:
+      t.sync_tempo_only = true;
       break;
     }
   }
@@ -4183,6 +4208,7 @@ int main(int argc, char **argv) {
   qnav_init(); // Initialize the menu/navigation global state
   // Initialize the 'Grid EDitor' stuff. This sits underneath the TUI.
   ged_init(&t.ged, (Usz)t.undo_history_limit, (Usz)init_bpm, (Usz)init_seed);
+  t.ged.sync_grid_shared = !t.sync_tempo_only;
   // This will need to be changed to work with conf/menu
   if (osolen(t.osc_midi_bidule_path) > 0) {
     midi_mode_deinit(&t.ged.midi_mode);
@@ -4209,11 +4235,13 @@ int main(int argc, char **argv) {
       // consecutive pids (13184 and 13185 both become 13185).
       t.ged.sync.self_id = ((U32)getpid() << 1) | 1u;
       t.ged.sync_enabled = true;
+      t.ged.sync.grid_shared = t.ged.sync_grid_shared;
       // Shared-grid identity: --name/--color are what other users see in the
       // cursor legend; osync generates a default name if none was given.
       osync_set_identity(&t.ged.sync, t.sync_name, t.sync_color);
       osync_set_edit_mode(&t.ged.sync, t.sync_edit_mode);
-      osync_set_grid_provider(&t.ged.sync, ged_grid_provider, &t.ged);
+      if (t.ged.sync_grid_shared)
+        osync_set_grid_provider(&t.ged.sync, ged_grid_provider, &t.ged);
       // Announce immediately so an already-running master hears us, and we
       // hear its reply.
       osync_announce(&t.ged.sync, t.ged.sync.role == Osync_role_master,

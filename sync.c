@@ -387,7 +387,7 @@ static void send_state(Osync *s, char const *path, bool is_master, bool playing,
                        socklen_t dest_len) {
   if (!s->dev)
     return;
-  I32 vals[15];
+  I32 vals[16];
   vals[0] = (I32)s->self_id;
   vals[1] = is_master ? 1 : 0;
   vals[2] = bpm;
@@ -409,6 +409,7 @@ static void send_state(Osync *s, char const *path, bool is_master, bool playing,
   vals[12] = (I32)s->self_cursor_w;
   vals[13] = (I32)s->self_color;
   vals[14] = (I32)s->edit_mode;
+  vals[15] = (I32)s->grid_shared;
   char buf[1024];
   Usz n = build_packet(buf, sizeof buf, path, vals, ORCA_ARRAY_COUNTOF(vals));
   if (!n)
@@ -678,6 +679,8 @@ static bool handle_packet(Osync *s, char const *data, Usz size,
     p->cursor_seen_ms = now_ms();
   if (n >= 15)
     p->edit_mode = (U8)vals[14];
+  if (n >= 16)
+    p->grid_shared = vals[15] != 0;
   }
   if (src_len > 0 && (Usz)src_len <= sizeof p->addr) {
     memcpy(&p->addr, src, (size_t)src_len);
@@ -876,8 +879,9 @@ void osync_set_cursor(Osync *s, Usz y, Usz x, Usz h, Usz w) {
 }
 
 void osync_send_cell_edit(Osync *s, Usz y, Usz x, Glyph glyph) {
-  if (!s->enabled || s->role != Osync_role_follower)
-    return; // the master applies its own edits directly
+  if (!s->enabled || s->role != Osync_role_follower ||
+      s->edit_mode != Osync_edit_mode_protected)
+    return;
   Osync_peer const *m = find_master(s);
   if (!m || !m->addr_len)
     return;
@@ -907,11 +911,8 @@ void osync_master_cell_edit(Osync *s, Usz y, Usz x, Glyph glyph) {
 }
 
 void osync_set_edit_mode(Osync *s, U8 mode) {
-  s->edit_mode = mode == Osync_edit_mode_open ? Osync_edit_mode_open
-                                              : Osync_edit_mode_master;
+  s->edit_mode = mode <= Osync_edit_mode_open ? mode : Osync_edit_mode_strict;
 }
-
-U8 osync_edit_mode(Osync const *s) { return s->edit_mode; }
 
 void osync_open_cell_edit(Osync *s, Usz y, Usz x, Glyph glyph) {
   if (!s->enabled || s->edit_mode != Osync_edit_mode_open)
@@ -976,7 +977,7 @@ bool osync_peer_cursor(Osync const *s, U32 id, Usz *y, Usz *x, Usz *h, Usz *w,
   for (Osync_peer const *p = s->peers; p; p = p->next) {
     if (p->id != id)
       continue;
-    if (p->cursor_seen_ms < cutoff)
+    if (!p->grid_shared || p->cursor_seen_ms < cutoff)
       return false;
     *y = p->cursor_y;
     *x = p->cursor_x;

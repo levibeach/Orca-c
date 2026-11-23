@@ -13,7 +13,7 @@
 // The wire format is plain OSC. Tempo/transport messages carry 32-bit int
 // arguments; the name message carries one string. Address paths are:
 //
-//   /orca/sync/hello|state  <id> <flags> <bpm> <tick> <rate_num> <rate_den> <playing> <started> <grid_ms> [<cursor_y> <cursor_x> <cursor_h> <cursor_w> <color>]
+//   /orca/sync/hello|state  <id> <flags> <bpm> <tick> <rate_num> <rate_den> <playing> <started> <grid_ms> [<cursor_y> <cursor_x> <cursor_h> <cursor_w> <color> <mode> <grid_shared>]
 //   /orca/sync/name         <id> <name (string)>
 //   /orca/grid/edit         <rev> <broadcaster_id> <author_id> <y> <x> <glyph> <seq> <mode>
 //   /orca/grid/chunk        <broadcaster_id> <rev> <index> <count> <width> <height> <packed glyphs...>
@@ -34,11 +34,13 @@ typedef enum {
   Osync_role_master = 1,
 } Osync_role;
 
-// Master: followers request edits and the master owns cell state.
-// Open: every participant applies its own edits and broadcasts them directly.
+// strict: only the master edits; followers are view-only.
+// protected: anyone can edit, but edits go through the master for revision.
+// open: everyone applies and broadcasts edits directly.
 typedef enum {
-  Osync_edit_mode_master = 0,
-  Osync_edit_mode_open = 1,
+  Osync_edit_mode_strict = 0,
+  Osync_edit_mode_protected = 1,
+  Osync_edit_mode_open = 2,
 } Osync_edit_mode;
 
 // A default 73x17 grid is ~20 chunks; keep room for substantially larger ones
@@ -61,6 +63,7 @@ typedef struct Osync_peer {
   bool name_sent;
   U8 color;
   U8 edit_mode; // peer's edit mode, from state announcements
+  bool grid_shared; // peer shares its grid; false for --sync-tempo peers
   Usz cursor_y, cursor_x, cursor_h, cursor_w;
   U64 cursor_seen_ms;
   struct sockaddr_storage addr;
@@ -88,6 +91,7 @@ typedef struct Osync {
   char self_name[Osync_name_max];
   U8 self_color;
   U8 edit_mode; // local mode; announced to peers
+  bool grid_shared; // whether this instance shares its grid
   U64 last_name_ms;
   Usz self_cursor_y, self_cursor_x, self_cursor_h, self_cursor_w;
   // Master-authoritative grid state. The master assigns revisions and
@@ -186,13 +190,12 @@ void osync_set_identity(Osync *s, char const *name, U8 color);
 // Select master-authoritative or open peer-to-peer editing. Applies locally
 // and is announced to peers on the next state packet.
 void osync_set_edit_mode(Osync *s, U8 mode);
-U8 osync_edit_mode(Osync const *s);
 
 // Publish our current cursor (and selection size) in state announcements.
 void osync_set_cursor(Osync *s, Usz y, Usz x, Usz h, Usz w);
 
-// Follower -> master: request that a cell be set. The master assigns the
-// revision, applies it locally and broadcasts it to everyone.
+// Protected mode: a follower requests a cell edit from the master. The master
+// assigns the revision, applies it and rebroadcasts to everyone.
 void osync_send_cell_edit(Osync *s, Usz y, Usz x, Glyph glyph);
 
 // Master -> followers: broadcast an edit made locally by the master. The
