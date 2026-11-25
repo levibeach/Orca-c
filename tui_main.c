@@ -2105,7 +2105,7 @@ staticni void ged_sync_poll(Ged *a) {
   // Periodic announcement, whether or not anything changed. Followers keep
   // telling the master they are here; the master keeps broadcasting so late
   // joiners can lock on.
-  U64 now = (U64)stm_ms(stm_now());
+  U64 now = osync_now_ms();
   if (now - a->sync.last_announce_ms >= 250) {
     osync_announce(&a->sync, a->sync.role == Osync_role_master,
                    a->is_playing, (I32)a->bpm, (U32)a->tick_num,

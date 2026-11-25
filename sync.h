@@ -149,6 +149,10 @@ void osync_deinit(Osync *s);
 // transport, in which case the caller should re-derive its clock.
 bool osync_poll(Osync *s);
 
+// Same monotonic millisecond clock used for sync timeouts. Callers must not
+// compare sync timestamps against stm_now(), which is process-relative.
+U64 osync_now_ms(void);
+
 // Send a state announcement. `playing` is the sender's transport state and
 // `grid_ms_low` is the system-monotonic origin of its base (1x) beat grid, so
 // followers can lock to the exact beat instead of the packet arrival time.

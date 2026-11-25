@@ -40,6 +40,8 @@ static U64 now_ms(void) {
   return (U64)ts.tv_sec * 1000u + (U64)(ts.tv_nsec / 1000000);
 }
 
+U64 osync_now_ms(void) { return now_ms(); }
+
 static char const path_hello[] = "/orca/sync/hello";
 static char const path_state[] = "/orca/sync/state";
 static char const path_name[] = "/orca/sync/name";
@@ -118,9 +120,8 @@ bool osync_init(Osync *s, U32 self_id, char const *bind_addr,
     s->target_ip = htonl(INADDR_LOOPBACK);
 
   if (multicast) {
-    // Bind the wildcard address on the group's port. Passing NULL here skips
-    // the bind entirely in oosc_dev_create_udp_ex(), leaving the socket on a
-    // random port -- which is why multicast sync never worked.
+    // Bind wildcard on the group's port. The socket opts into address/port
+    // reuse so every local instance can receive the same multicast traffic.
     oe = oosc_dev_create_udp_ex(&s->dev, daddr, dport, "0.0.0.0", 1, &err,
                                 true);
     if (oe == Oosc_udp_create_error_ok) {

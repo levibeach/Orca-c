@@ -124,13 +124,15 @@ Oosc_udp_create_error oosc_dev_create_udp_ex(Oosc_dev **out_ptr,
         *out_errno = berr != 0 ? EADDRNOTAVAIL : EINVAL;
       return Oosc_udp_create_error_getaddrinfo_failed;
     }
-    // Several instances on one machine want the same sync port, so the sync
-    // socket opts into SO_REUSEADDR. Note that on Linux this makes the kernel
-    // round-robin incoming unicast between the sharing sockets, which is why
-    // sync packets carry a sender id and peers are also addressed directly.
+    // Several instances on one machine want the same sync port. SO_REUSEADDR
+    // allows the bind; SO_REUSEPORT makes multicast delivery reach every
+    // socket instead of only the first one bound.
     if (reuse_addr || bind_flags) {
       int one = 1;
       setsockopt(udpfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+      setsockopt(udpfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
     }
     if (bind(udpfd, bhead->ai_addr, bhead->ai_addrlen) < 0) {
 #if 0
